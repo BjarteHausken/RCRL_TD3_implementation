@@ -1,0 +1,4 @@
+# Trained model checkpoints
+*.pth
+*.pt
+*.ckpt

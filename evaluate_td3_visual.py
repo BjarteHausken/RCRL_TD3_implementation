@@ -3,6 +3,7 @@ import os
 import argparse
 
 from agents.td3 import TD3
+from agents.rcrl_td3 import RCRL_TD3
 from double_integrator_sim.dynamics import DoubleIntegratorExactDiscretization
 from double_integrator_sim.environment import CorridorEnvironment
 
@@ -24,15 +25,15 @@ def create_env():
 
     return env
 
-def main(MODEL_PATH):
+def main(MODEL_PATH, agent_type="td3"):
     env = create_env()
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
 
-    # Create TD3 agent
-    policy = TD3(state_dim, action_dim, max_action)
+    agent_class = {"td3": TD3, "rcrl_td3": RCRL_TD3}[agent_type]
+    policy = agent_class(state_dim, action_dim, max_action)
     policy.load(MODEL_PATH)
     print("Loaded model:", MODEL_PATH)
 
@@ -69,16 +70,22 @@ def main(MODEL_PATH):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate TD3 on Double Integrator Environment")
+    parser = argparse.ArgumentParser(description="Visually evaluate a TD3 or RCRL-TD3 agent")
 
     parser.add_argument(
         "--name",
         type=str,
-        help="Path to the trained TD3 model"
+        help="Run directory under models/"
+    )
+    parser.add_argument(
+        "--agent",
+        choices=("td3", "rcrl_td3"),
+        default="td3",
+        help="Agent type and checkpoint format (default: td3)",
     )
 
     args = parser.parse_args()
 
-    MODEL_PATH = os.path.join("models", args.name, "td3")
+    MODEL_PATH = os.path.join("models", args.name, args.agent)
 
-    main(MODEL_PATH)
+    main(MODEL_PATH, args.agent)
