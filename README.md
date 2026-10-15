@@ -1,15 +1,80 @@
 # RCRL-TD3
 
-This project adapts Reachability Constrained Reinforcement Learning (RCRL) to the existing TD3 corridor-navigation agent. It retains TD3 for reward learning and adds RCRL's reachability safety value, statewise Lagrange multiplier, and separated update time scales.
+Reinforcement learning for a double-integrator agent that navigates a pillar-filled corridor from a start wall to a goal wall, avoiding collisions with walls and pillars. The repository contains:
 
-The implementation is an adaptation, not a reproduction of the paper's experiments: the paper's Algorithm 1 is a deterministic actor-critic template, which the paper evaluates in both on-policy and off-policy variants. This repository uses TD3 as its off-policy base. The RCRL safety objective, statewise Lagrangian, and dual update are preserved.
+- a **TD3 baseline** that maximizes a progress-based reward, and
+- an **RCRL (Reachability Constrained Reinforcement Learning) agent** that learns the same reward while explicitly learning a reachability safety value, so collision avoidance comes from the learned constraint rather than from reward shaping alone.
+
+The RCRL implementation is an adaptation, not a reproduction, of the paper's experiments: the paper's Algorithm 1 is a deterministic actor-critic template, which the paper evaluates in both on-policy and off-policy variants. This repository uses TD3 as its off-policy base. The RCRL safety objective, statewise Lagrangian, and dual update are preserved.
+
+## Repository structure
+
+```text
+agents/
+  td3.py                     Plain TD3 (original implementation)
+  rcrl_td3.py                TD3 + RCRL safety critic, statewise multiplier
+double_integrator_sim/
+  dynamics.py                Exact double-integrator discretization (dt = 0.1 s)
+  environment.py             Gymnasium corridor environment
+  layouts/generate_layouts.py  Random pillar-layout generator
+  manual_control.py          Manual keyboard driving for environment sanity checks
+layouts/                     Layout sets: <set>_{train,test,validation}.npy
+models/                      Training runs (checkpoints + config.json)
+utils.py                     Replay buffers (plain, and RCRL with h/h')
+train_rcrl_td3.py            Main trainer (RCRL or TD3 via --agent)
+train_td3.py                 Standalone TD3 trainer (legacy, fixed constants)
+evaluate_td3.py              Headless evaluation over all test layouts
+evaluate_td3_visual.py       Rendered single-episode evaluation
+test.py                      Environment checks (gymnasium check_env, margins)
+```
+
+## Requirements
+
+Python with NumPy, PyTorch, Gymnasium, and Matplotlib. There is no checked-in lockfile. From the repository root:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install numpy torch gymnasium matplotlib
+```
+
+All commands below run from the repository root.
+
+## Environment
+
+A corridor of length 30 m and width 5 m with cylindrical pillars (radius 0.5 m) placed between the start and goal walls.
+
+| | |
+| --- | --- |
+| Dynamics | double integrator, `dt = 0.1 s`, speed clamped at 3.0 m/s |
+| Action | 2D acceleration command, clipped to ±2.0 m/s² |
+| Observation | velocity (2) + 64 lidar rays of 5.0 m range → 66-dim |
+| Termination | wall/pillar collision, or goal reached (`x >= length`) |
+| Truncation | 1000-step time limit (bootstrapped) |
+| Reward | `5 * Δx - 0.1` per step, +50 on reaching the goal |
+
+The state constraint is `h(s) = vehicle_radius - min(lidar_distances)`, where `vehicle_radius = 0.2 m`; see [Constraint convention](#constraint-convention).
+
+## Layouts
+
+Pillar layouts live in `layouts/` as `<set>_{train,test,validation}.npy`, each an array of `(x, y, radius)` pillars per layout (the default `one` set has 30 train, 10 test, and 10 validation layouts). Generate a new set with:
+
+```bash
+python double_integrator_sim/layouts/generate_layouts.py --name myset --num-pillars 6
+```
+
+All training and evaluation scripts select the set with `--layout-set` (default `one`); the set name is recorded in each run's `config.json`, so a checkpoint should be evaluated with the same `--layout-set` it was trained on.
 
 ## Run training
 
-From the repository root:
-
 ```bash
 python train_rcrl_td3.py --name my_rcrl_run
+```
+
+The same script trains the plain TD3 baseline (same two-phase schedule and
+random-start coverage, but no safety critic or multiplier) with `--agent td3`:
+
+```bash
+python train_rcrl_td3.py --name my_td3_run --agent td3
 ```
 
 For a small end-to-end check:
@@ -20,14 +85,27 @@ python train_rcrl_td3.py --name rcrl_smoke --max-timesteps 8 \
   --eval-freq 0 --log-freq 1 --output-dir /tmp/rcrl_runs
 ```
 
-Checkpoints are written under `models/<name>/` with the `rcrl_td3` prefix. Use them with:
+Checkpoints are written under `models/<name>/` with the agent name as prefix (`rcrl_td3` or `td3`); the agent is recorded in `config.json`. `train_td3.py` is a legacy standalone TD3 trainer with fixed module-level constants; `train_rcrl_td3.py --agent td3` is its configurable replacement.
+
+## Evaluation
+
+Evaluate a checkpoint on all test layouts with the matching `--agent`:
 
 ```bash
 python evaluate_td3.py --name my_rcrl_run --agent rcrl_td3
 python evaluate_td3_visual.py --name my_rcrl_run --agent rcrl_td3
 ```
 
-Pillar layouts live in `layouts/` as `<set>_{train,test,validation}.npy` (see `double_integrator_sim/layouts/generate_layouts.py` for generation). All training and evaluation scripts select the set with `--layout-set` (default `one`); the set name is recorded in each run's `config.json`, so a checkpoint should be evaluated with the same `--layout-set` it was trained on.
+`evaluate_td3_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout.
+
+## Manual control and tests
+
+```bash
+python double_integrator_sim/manual_control.py   # drive manually (needs a display)
+python test.py                                   # check_env, random-state margins, custom reset
+```
+
+`test.py` is an exploratory script (not a pytest suite). Re-run it when changing environment behavior.
 
 ## Constraint convention
 
