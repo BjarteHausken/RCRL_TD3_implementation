@@ -1,4 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+
 # Trained model checkpoints
 *.pth
 *.pt
 *.ckpt
+
+# Generated layout data
+*.npy
+
+# Models and layout data (root folders)
+/models/
+/layouts/

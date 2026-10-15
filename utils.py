@@ -49,19 +49,30 @@ class ReplayBufferRCRLTD3(object):
         self.action = np.zeros((max_size, action_dim))
         self.next_state = np.zeros((max_size, state_dim))
         self.reward = np.zeros((max_size, 1))
-        self.next_constraint = np.zeros((max_size, 1))
+        self.h = np.zeros((max_size, 1))
+        self.next_h = np.zeros((max_size, 1))
         self.not_done = np.zeros((max_size, 1))
 
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
-    def add(self, state, action, next_state, reward, next_constraint, done):
+    def add(
+        self,
+        state,
+        action,
+        next_state,
+        reward,
+        constraint,
+        next_constraint,
+        done,
+    ):
         self.state[self.ptr] = state
         self.action[self.ptr] = action
         self.next_state[self.ptr] = next_state
         self.reward[self.ptr] = reward
-        self.next_constraint[self.ptr] = next_constraint
+        self.h[self.ptr] = constraint
+        self.next_h[self.ptr] = next_constraint
         self.not_done[self.ptr] = 1.0 - done
 
         self.ptr = (self.ptr + 1) % self.max_size
@@ -75,6 +86,7 @@ class ReplayBufferRCRLTD3(object):
             torch.FloatTensor(self.action[ind]).to(self.device),
             torch.FloatTensor(self.next_state[ind]).to(self.device),
             torch.FloatTensor(self.reward[ind]).to(self.device),
-            torch.FloatTensor(self.next_constraint[ind]).to(self.device),
+            torch.FloatTensor(self.h[ind]).to(self.device),
+            torch.FloatTensor(self.next_h[ind]).to(self.device),
             torch.FloatTensor(self.not_done[ind]).to(self.device),
         )

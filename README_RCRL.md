@@ -1,58 +1,18 @@
-# RCRL-TD3 additions
+# RCRL-TD3
 
-This note describes the reachability-constrained reinforcement learning (RCRL) pieces added alongside the existing TD3 implementation. The RCRL agent keeps TD3's reward-learning setup and adds a second critic that estimates future constraint values.
+This project adapts Reachability Constrained Reinforcement Learning (RCRL) to the existing TD3 corridor-navigation agent. It retains TD3 for reward learning and adds RCRL's reachability safety value, statewise Lagrange multiplier, and separated update time scales.
 
-## What was added
+The implementation is an adaptation, not a reproduction of the paper's experiments: the paper's Algorithm 1 is a deterministic actor-critic template, which the paper evaluates in both on-policy and off-policy variants. This repository uses TD3 as its off-policy base. The RCRL safety objective, statewise Lagrangian, and dual update are preserved.
 
-### `agents/rcrl_td3.py`
+## Run training
 
-`RCRL_TD3` is the agent implementation. It contains:
-
-- **Actor:** the same deterministic policy structure used by TD3. It maps the current observation to an action.
-- **Reward critic:** TD3's twin Q networks, trained to estimate expected reward.
-- **Safety critic:** `SafetyCritic`, a separate network that takes an observation and action and estimates the largest constraint value encountered along the policy's future trajectory.
-- **Target networks:** slowly updated copies used to form stable reward and safety learning targets.
-
-The environment's constraint is `vehicle_radius - min(lidar_distances)`. A value at or below zero means the nearest sensed surface is at least one vehicle radius away; a positive value means the vehicle's circular footprint would overlap that surface. The safety critic uses the same sign convention: predicted value `<= 0` means safe according to its estimate, and `> 0` means predicted violation.
-
-For a nonterminal transition, its training target is the maximum of the observed next-state constraint and the target safety critic's estimate at the next state under the target actor. For terminal transitions, it uses the observed next-state constraint without bootstrapping. This teaches the critic to represent the largest predicted constraint along the policy continuation.
-
-The actor objective currently combines reward and a fixed safety penalty:
-
-```text
-actor_loss = -mean(reward_Q) + mean(relu(safety_Q))
-```
-
-The ReLU penalizes predicted positive constraint values. Its weight is currently `1.0`; a Lagrange multiplier has not been implemented. During this update, critic parameters are frozen while gradients still pass through the critics to the action, so the actor can learn from their outputs without adding actor-loss gradients to critic parameters.
-
-### `ReplayBufferRCRLTD3` in `utils.py`
-
-The RCRL buffer stores the usual transition data—observation, action, next observation, reward, and terminal flag—plus the **next-state constraint**. `RCRL_TD3.train()` samples that constraint to update the safety critic.
-
-In the RCRL training loop, true terminal states (`terminated`, such as collision or reaching the goal) stop bootstrapping. Time-limit truncations do not stop bootstrapping.
-
-### `train_rcrl_td3.py`
-
-This script trains the RCRL agent in the corridor environment, stores the constraint from `info["constraint"]` on every transition, periodically evaluates on validation layouts, and saves a final checkpoint. It retains the environment's existing observation: velocity and lidar readings, without absolute position. This supports training across layouts without directly providing global coordinates.
-
-Example full run:
+From the repository root:
 
 ```bash
 python train_rcrl_td3.py --name my_rcrl_run
 ```
 
-Useful options:
-
-```text
---max-timesteps   Training steps (default: 30000)
---start-timesteps Random-action exploration steps (default: 10000)
---batch-size      Minibatch size (default: 256)
---seed            Random seed (default: 0)
---eval-freq       Evaluation interval; use 0 to disable (default: 5000)
---output-dir      Checkpoint root (default: models)
-```
-
-For a short run to check the training path:
+For a small end-to-end check:
 
 ```bash
 python train_rcrl_td3.py --name rcrl_smoke --max-timesteps 8 \
@@ -60,28 +20,109 @@ python train_rcrl_td3.py --name rcrl_smoke --max-timesteps 8 \
   --eval-freq 0 --log-freq 1 --output-dir /tmp/rcrl_runs
 ```
 
-### Evaluation scripts
-
-Both `evaluate_td3.py` and `evaluate_td3_visual.py` accept `--agent td3` or `--agent rcrl_td3`. The default is `td3`, so existing TD3 commands continue to work. The selected agent determines which checkpoint prefix is loaded from `models/<name>/`.
-
-Evaluate all test layouts:
+Checkpoints are written under `models/<name>/` with the `rcrl_td3` prefix. Use them with:
 
 ```bash
 python evaluate_td3.py --name my_rcrl_run --agent rcrl_td3
-```
-
-Render an episode:
-
-```bash
 python evaluate_td3_visual.py --name my_rcrl_run --agent rcrl_td3
 ```
 
-### Checkpoints
+Pillar layouts live in `layouts/` as `<set>_{train,test,validation}.npy` (see `double_integrator_sim/layouts/generate_layouts.py` for generation). All training and evaluation scripts select the set with `--layout-set` (default `one`); the set name is recorded in each run's `config.json`, so a checkpoint should be evaluated with the same `--layout-set` it was trained on.
 
-RCRL training writes files under `models/<name>/` using the `rcrl_td3` prefix. Besides actor and reward-critic weights and optimizer states, the checkpoint includes safety-critic weights and its optimizer state. Loading reconstructs target networks from the loaded online networks.
+## Constraint convention
 
-## Current limits
+The environment defines the state constraint as:
 
-The safety critic is a learned estimate and the actor uses a soft penalty. `select_action()` returns the actor's action directly; there is no runtime action filter or formal safety guarantee. The estimate also depends on the training data, the constraint signal, and the policy used for bootstrapping. Treat collision and success rates on held-out layouts as empirical results, not proof of safety.
+```text
+h(s) = vehicle_radius - min(lidar_distances)
+```
 
-The constraint is based on sampled lidar rays and the environment checks collision at the end of a simulation step. It can therefore miss geometric or between-step collision details. The fixed safety-penalty weight is intended for an initial runnable implementation and should be tuned or replaced by a constrained optimization method for further experiments.
+Therefore `h(s) <= 0` is safe and `h(s) > 0` means the sensed vehicle footprint overlaps a wall or pillar. The replay buffer stores both `h(s)` before the action and `h(s')` after it. The current-state value is essential: reachability is about the worst violation from the current state onward, not only the next collision signal.
+
+## How TD3 is adjusted to RCRL
+
+### 1. Learn a reachability safety value
+
+Alongside TD3's twin reward critics, `SafetyCritic` learns the action-conditioned value `Q_h(s, a)`. It estimates the discounted worst constraint value that will occur when action `a` is taken and then the policy is followed. Its sign has a direct interpretation:
+
+- `Q_h(s, a) <= 0`: predicted persistently safe trajectory.
+- `Q_h(s, a) > 0`: predicted future constraint violation.
+
+The target in `agents/rcrl_td3.py` is:
+
+```text
+Q_h_target = (1 - gamma) h(s)
+             + gamma max(h(s), Q_h_target(s', pi_target(s')))
+```
+
+This is the discounted RCRL self-consistency update. In contrast to a cost-return critic, `max` retains the worst safety violation instead of summing costs. The safety target uses the unperturbed target actor; TD3's target-action noise is used only for the reward critic. On collision or goal terminals, bootstrapping is replaced by the recorded terminal `h(s')`; time-limit truncations still bootstrap.
+
+### 2. Optimize reward subject to a statewise safety constraint
+
+The actor minimizes the surrogate RCRL Lagrangian:
+
+```text
+L_actor = mean(-Q(s, pi(s)) + lambda(s) Q_h(s, pi(s)))
+```
+
+A predicted unsafe value is positive, so it increases the actor loss. A ReLU or sign reversal is intentionally not used: both would change the constraint direction. During this update critic weights are frozen, while gradients still flow from their outputs through the action into the actor.
+
+### 3. Learn a state-dependent multiplier
+
+`MultiplierNetwork` produces `lambda(s)`, rather than one global penalty. It uses Softplus to remain nonnegative and clips its output to `--max-lambda`. The multiplier is updated by gradient ascent on `lambda(s) Q_h(s, pi(s))`, implemented as minimization of its negative with the actor and safety critic detached. Thus it grows at states predicted to be unsafe and stays bounded for infeasible states.
+
+### 4. Separate update time scales
+
+The reward critic and safety critic update every gradient step. The actor updates every `--policy-freq` steps (default 2), and the multiplier every `--multiplier-freq` steps (default 6). The default learning rates also make critic/safety updates faster than actor updates, and multiplier updates slowest:
+
+| Option | Default | Purpose |
+| --- | ---: | --- |
+| `--critic-lr` | `1e-4` | TD3 reward-critic learning rate |
+| `--safety-lr` | `1e-4` | reachability safety-critic learning rate |
+| `--actor-lr` | `2e-5` | policy learning rate |
+| `--multiplier-lr` | `1e-6` | statewise dual-ascent learning rate |
+| `--policy-freq` | `2` | actor/target update interval |
+| `--multiplier-freq` | `6` | multiplier update interval |
+| `--max-lambda` | `100` | upper multiplier bound |
+| `--initial-lambda` | `0.1` | initial multiplier output |
+
+### 5. Preserve stable TD3 reward learning
+
+The reward critic remains TD3: twin Q-functions, clipped target-policy noise, delayed actor updates, and Polyak target averaging:
+
+```text
+target = tau * online + (1 - tau) * target
+```
+
+The actor, reward critic, safety critic, multiplier, and each optimizer are saved in every RCRL checkpoint. Older actor/reward-only checkpoints can still be loaded for evaluation, but they cannot faithfully resume RCRL training.
+
+## Feasible-set coverage (random resets and critic warmup)
+
+RCRL imposes its constraint on the states in the support of the initial-state distribution (Prop. 4.1 of the paper), and the dual update only learns `lambda(s)` for states that appear in the replay buffer. With only the fixed start, that support is a single point. On top of that, the time-based reward pushes the agent toward the fastest trajectories, which hug the feasible-set boundary, so the interior of the feasible set (where `V_h` should stay `<= 0`) is underrepresented.
+
+Training is therefore split into two phases:
+
+1. **Random-exploration phase** (`t < --start-timesteps`, default 10000 steps): random actions, and every episode starts from a random safe state. During this phase the reward critic and safety critic are trained (`RCRLTD3.train_warmup`) while the actor and multiplier stay frozen, so `Q_h` is learned over a broad slice of the feasible set before the reward-driven policy starts, at no extra time cost.
+2. **Learning phase** (`t >= --start-timesteps`): the policy with exploration noise runs from the standard start (the deployment scenario) with full RCRL training.
+
+| Option | Default | Purpose |
+| --- | ---: | --- |
+| `--start-timesteps` | `10_000` | length of the random-exploration (critic warmup) phase |
+| `--reset-mode` | `fixed` | learning-phase episode starts: `fixed` keeps the standard start; `mixed` starts each episode from a random state with probability `--random-reset-frac` |
+| `--random-reset-frac` | `0.15` | probability of a random start in `mixed` mode |
+| `--random-reset-margin` | `0.3` | extra clearance (m) beyond the collision boundary for random start states |
+| `--random-reset-max-speed` | `1.0` | maximum initial speed (m/s) for random start states |
+
+Random start states are sampled by `CorridorEnvironment.sample_random_state`, which draws positions uniformly from the corridor while keeping `vehicle_radius + margin` clearance from the walls and `pillar_radius + vehicle_radius + margin` clearance from every pillar, and draws the velocity uniformly from a disk of radius `--random-reset-max-speed`.
+
+The defaults already include the coverage mechanism, so the fastest-to-goal objective is covered by the plain command `python train_rcrl_td3.py --name my_rcrl_run`. Use `--reset-mode mixed` to keep injecting random starts during the learning phase (e.g. to maintain constraint data over the wider state set once the base policy has converged). Evaluation always uses the fixed deployment start.
+
+## Important limits
+
+RCRL's formal guarantees assume a deterministic Markov decision process, exact multi-time-scale updates, bounded/projection-compatible parameterizations, and an initial-state distribution that covers the largest feasible set (see [Feasible-set coverage](#feasible-set-coverage-random-resets-and-critic-warmup) for the training options that widen this distribution). This corridor experiment uses neural networks, finite replay training, and observations made from velocity plus lidar rather than the full physical state. Treat success and collision rates as empirical evidence, not a formal persistent-safety guarantee.
+
+The actor has no runtime safety filter. It returns its learned action directly, so safety depends on the learned safety critic and the data encountered during training.
+
+## Reference
+
+Yu, D., Ma, H., Li, S. E., & Chen, J. (2022). *Reachability Constrained Reinforcement Learning*. ICML 2022. https://proceedings.mlr.press/v162/yu22d.html

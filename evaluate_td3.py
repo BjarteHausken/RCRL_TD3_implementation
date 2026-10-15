@@ -1,4 +1,3 @@
-import time
 import os
 import argparse
 
@@ -8,7 +7,7 @@ from double_integrator_sim.dynamics import DoubleIntegratorExactDiscretization
 from double_integrator_sim.environment import CorridorEnvironment
 
 
-def create_env():
+def create_env(layout_set):
     dynamics = DoubleIntegratorExactDiscretization(
         dt=0.1,
         max_velocity=3.0
@@ -21,12 +20,13 @@ def create_env():
         max_acceleration=2.0,
         lidar_range=5.0,
         num_lidar_rays=64,
+        layout_set=layout_set,
     )
 
     return env
 
-def main(MODEL_PATH, agent_type="td3"):
-    env = create_env()
+def main(MODEL_PATH, agent_type="td3", layout_set="one"):
+    env = create_env(layout_set)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -40,9 +40,7 @@ def main(MODEL_PATH, agent_type="td3"):
     successes = 0
 
     for layout_idx in range(len(env.test_layouts)):
-        env.set_test_layout(layout_idx)
-        
-        state, info = env.reset(layout_type="fixed")
+        state, info = env.reset(layout_type="test", layout_index=layout_idx)
 
         while True:
             # IMPORTANT: No exploration noise during evaluation
@@ -84,10 +82,15 @@ if __name__ == "__main__":
         default="td3",
         help="Agent type and checkpoint format (default: td3)",
     )
+    parser.add_argument(
+        "--layout-set",
+        default="one",
+        help="Layout set name; loads layouts/<name>_{train,test,validation}.npy",
+    )
 
     args = parser.parse_args()
 
     MODEL_PATH = os.path.join("models", args.name, args.agent)
 
-    main(MODEL_PATH, args.agent)
+    main(MODEL_PATH, args.agent, args.layout_set)
 

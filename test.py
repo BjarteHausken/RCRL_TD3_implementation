@@ -80,7 +80,7 @@ def test_lidar(env):
     center = np.array([3.0, 0.0])
     radius = 0.5
 
-    distance = env.ray_circle_intersection(
+    distance = env._ray_circle_intersection(
         origin,
         direction,
         center,
@@ -91,7 +91,7 @@ def test_lidar(env):
     
     direction = np.array([0.0, 1.0])
 
-    distance = env.ray_circle_intersection(
+    distance = env._ray_circle_intersection(
         origin,
         direction,
         center,
@@ -104,7 +104,7 @@ def test_lidar(env):
     origin = np.array([5.0, 0.0])
     direction = np.array([0.0, 1.0])
 
-    distance = env.ray_wall_intersection(
+    distance = env._ray_wall_intersection(
         origin,
         direction
     )
@@ -203,9 +203,40 @@ def test_reward_and_constraints(env):
             f"goal={info['goal_reached']}, "
         )
 
+def test_random_state_sampling(env):
+    # Sampled states must be collision-free and keep at least the requested
+    # clearance margin from walls and pillars
+    margin = 0.3
+    max_speed = 1.0
+    for _ in range(50):
+        state = env.sample_random_state(margin=margin, max_speed=max_speed)
+        x, x_dot, y, y_dot = state
+        env.dynamics.state = state
+
+        assert not env.check_collision(), f"sampled state collides: {state}"
+        assert env.width / 2 - abs(y) - env.vehicle_radius >= margin - 1e-6
+        assert x - env.vehicle_radius - margin >= 0.0 - 1e-6
+        for pillar_x, pillar_y, pillar_radius in env.pillars:
+            assert np.hypot(x - pillar_x, y - pillar_y) >= (
+                pillar_radius + env.vehicle_radius + margin - 1e-6
+            ), f"sampled state too close to pillar: {state}"
+        assert np.hypot(x_dot, y_dot) <= max_speed + 1e-6
+
+    print("PASS: random state sampling respects collision margins")
+
+    # reset(state=...) must apply the sampled state and keep the
+    # observation inside the observation space
+    state = env.sample_random_state(margin=margin, max_speed=max_speed)
+    obs, _ = env.reset(layout_type="fixed", state=state)
+    np.testing.assert_allclose(env.dynamics.get_state(), state, atol=1e-6)
+    assert env.observation_space.contains(obs)
+
+    print("PASS: reset with a custom state")
+
 #test_collisions(env)
 #test_render(env)
 #test_lidar(env)
 test_gymnasium_env(env)
+test_random_state_sampling(env)
 #test_velocity_limit(dynamics)
 #test_reward_and_constraints(env)
