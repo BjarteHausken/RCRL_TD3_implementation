@@ -417,8 +417,11 @@ class CorridorEnvironment(gym.Env):
 
         if self.fig is None:
             self.fig, self.ax = plt.subplots(figsize=(12, 4))
-            plt.ion()
-            plt.show(block=False)
+            # Headless backends (e.g. Agg) have no window to open or update.
+            self._headless = plt.get_backend().lower() == "agg"
+            if not self._headless:
+                plt.ion()
+                plt.show(block=False)
         self.ax.clear()
         ax = self.ax
 
@@ -508,7 +511,8 @@ class CorridorEnvironment(gym.Env):
         ax.set_ylabel("y [m]")
         ax.grid(True, alpha=0.15)
 
-        # Update interactive frame
-        self.fig.canvas.draw_idle()
-        self.fig.canvas.flush_events()
-        plt.pause(0.001)
+        # Update interactive frame (no-op on headless backends like Agg)
+        if not self._headless:
+            self.fig.canvas.draw_idle()
+            self.fig.canvas.flush_events()
+            plt.pause(0.001)

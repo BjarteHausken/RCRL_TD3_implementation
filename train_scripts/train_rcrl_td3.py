@@ -207,13 +207,16 @@ def main(args):
                 f"Random exploration complete at step {timestep + 1}; "
                 f"full RCRL training started"
             )
-
+        
+        i = 0
         if terminated or truncated:
-            print(
-                f"Episode {episode_num:4d} | step {timestep + 1:7d} | "
-                f"length {episode_steps:4d} | reward {episode_reward:8.3f} | "
-                f"collision {info['collision']} | goal {info['goal_reached']}"
-            )
+            i += 1
+            if i % 50 == 0:
+                print(
+                    f"Episode {episode_num:4d} | step {timestep + 1:7d} | "
+                    f"length {episode_steps:4d} | reward {episode_reward:8.3f} | "
+                    f"collision {info['collision']} | goal {info['goal_reached']}"
+                )
             state, used_random = reset_for_episode(
                 env,
                 args.reset_mode,
@@ -224,7 +227,8 @@ def main(args):
             )
             if used_random:
                 x, _, y, _ = env.dynamics.get_state()
-                print(f"  -> random start at ({x:.2f}, {y:.2f})")
+                if i % 50 == 0:
+                    print(f"  -> random start at ({x:.2f}, {y:.2f})")
             episode_reward = 0.0
             episode_steps = 0
             episode_num += 1

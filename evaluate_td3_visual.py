@@ -2,12 +2,20 @@ import time
 import os
 import argparse
 
+import matplotlib
+from PIL import Image
+
 from agents.td3 import TD3
 from agents.rcrl_td3 import RCRL_TD3
 from environment import create_env
 
 
-def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one", obs_type="lidar"):
+def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one", obs_type="lidar",
+         save_gif=None, gif_max_width=900):
+    if save_gif is not None:
+        # Headless capture: no interactive window, frames come from the canvas buffer.
+        matplotlib.use("Agg")
+
     env = create_env(layout_set, obs_type)
 
     state_dim = env.observation_space.shape[0]
@@ -33,6 +41,7 @@ def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one", o
     
     episode_reward = 0
     step_count = 0
+    frames = []
 
     while True:
         # IMPORTANT: No exploration noise during evaluation
@@ -46,11 +55,35 @@ def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one", o
         # Render current state
         env.render()
 
-        # Slow simulation to approximately real time
-        time.sleep(env.dynamics.dt)
+        if save_gif is not None:
+            env.fig.canvas.draw()
+            width, height = env.fig.canvas.get_width_height()
+            frame = Image.frombuffer(
+                "RGBA", (width, height), env.fig.canvas.buffer_rgba(), "raw", "RGBA", 0, 1
+            )
+            frame = frame.convert("RGB")
+            if width > gif_max_width:
+                # Downscale to bound the gif's size and memory use.
+                new_width = gif_max_width
+                new_height = max(1, round(height * new_width / width))
+                frame = frame.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            frames.append(frame)
+        else:
+            # Slow simulation to approximately real time
+            time.sleep(env.dynamics.dt)
 
         if terminated or truncated:
             break
+
+    if save_gif is not None:
+        frames[0].save(
+            save_gif,
+            save_all=True,
+            append_images=frames[1:],
+            duration=int(round(1000.0 * env.dynamics.dt)),
+            loop=0,
+        )
+        print(f"Gif saved: {save_gif} ({len(frames)} frames)")
 
     print()
     print("Episode finished")
@@ -92,6 +125,19 @@ if __name__ == "__main__":
         default="lidar",
         help="Observation variant the checkpoint was trained with",
     )
+    parser.add_argument(
+        "--save-gif",
+        metavar="PATH",
+        default=None,
+        help="Save the episode as a looping gif to PATH (runs headless, no window)",
+    )
+    parser.add_argument(
+        "--gif-max-width",
+        type=int,
+        default=900,
+        metavar="PIXELS",
+        help="Maximum gif frame width in pixels; wider frames are downscaled (default: 900)",
+    )
 
     args = parser.parse_args()
 
@@ -103,4 +149,7 @@ if __name__ == "__main__":
 
     MODEL_PATH = os.path.join("models", args.name, args.agent)
 
-    main(MODEL_PATH, args.agent, args.test_layout, args.layout_set, args.obs)
+    main(
+        MODEL_PATH, args.agent, args.test_layout, args.layout_set, args.obs,
+        args.save_gif, args.gif_max_width,
+    )

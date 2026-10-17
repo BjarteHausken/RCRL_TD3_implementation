@@ -14,6 +14,7 @@ agents/
   td3.py                     Plain TD3 (original implementation)
   rcrl_td3.py                TD3 + RCRL safety critic, statewise multiplier
 environment/
+  __init__.py                create_env factory (standard corridor parameters)
   dynamics.py                Exact double-integrator discretization (dt = 0.1 s)
   environment.py             Gymnasium corridor environment
   layouts/generate_layouts.py  Random pillar-layout generator
@@ -21,8 +22,10 @@ environment/
 layouts/                     Layout sets: <set>_{train,test,validation}.npy
 models/                      Training runs (checkpoints + config.json)
 utils.py                     Replay buffers (plain, and RCRL with h/h')
+train.sh                     Wrapper: ./train.sh <rcrl|rcrl-vec|td3> [trainer flags]
 train_scripts/
   train_rcrl_td3.py          Trainer for the RCRL agent
+  train_rcrl_td3_vec.py      Vectorized RCRL trainer (parallel envs, device buffer)
   train_td3.py               Trainer for the plain TD3 baseline
 evaluate_td3.py              Headless evaluation over all test layouts
 evaluate_td3_visual.py       Rendered single-episode evaluation
@@ -50,7 +53,7 @@ A corridor of length 30 m and width 5 m with cylindrical pillars (radius 0.5 m) 
 | Action | 2D acceleration command, clipped to ±2.0 m/s² |
 | Observation | velocity (2) + 64 lidar rays of 5.0 m range → 66-dim |
 | Termination | wall/pillar collision, or goal reached (`x >= length`) |
-| Truncation | 1000-step time limit (bootstrapped) |
+| Truncation | 1000-step time limit (bootstrapped; configurable via `max_steps`) |
 | Reward | `5 * Δx - 0.1` per step, +50 on reaching the goal |
 
 The state constraint is `h(s) = vehicle_radius - min(lidar_distances)`, where `vehicle_radius = 0.2 m`; see [Constraint convention](#constraint-convention).
@@ -82,6 +85,27 @@ but no safety critic or multiplier) has its own trainer:
 python -m train_scripts.train_td3 --name my_td3_run
 ```
 
+### Vectorized RCRL training
+
+`train_rcrl_td3_vec.py` runs the same algorithm with the same update-to-data
+ratio, but with `--num-envs` parallel environments (default 32): one batched
+actor forward pass per vectorized step, a device-resident replay buffer, and
+back-to-back per-transition updates. Checkpoints and `config.json` have the
+same format as the sequential trainer, so evaluation is unchanged:
+
+```bash
+python -m train_scripts.train_rcrl_td3_vec --name my_rcrl_vec --num-envs 32
+```
+
+All three trainers are also available through the wrapper script, which
+selects the module by agent name and passes the flags through unchanged:
+
+```bash
+./train.sh rcrl --name my_rcrl_run
+./train.sh rcrl-vec --name my_rcrl_vec --num-envs 32
+./train.sh td3 --name my_td3_run
+```
+
 For a small end-to-end check:
 
 ```bash
@@ -100,6 +124,8 @@ Evaluate a checkpoint on all test layouts with the matching `--agent`:
 python evaluate_td3.py --name my_rcrl_run --agent rcrl_td3
 python evaluate_td3_visual.py --name my_rcrl_run --agent rcrl_td3
 ```
+
+`evaluate_td3.py` reports per-layout outcomes and the same aggregates as the in-training evaluation: mean reward, mean steps, success rate, and collision rate.
 
 `evaluate_td3_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout.
 

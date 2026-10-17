@@ -16,3 +16,4 @@ __pycache__/
 # Models and layout data (root folders)
 /models/
 /layouts/
+/gifs/
