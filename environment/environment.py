@@ -356,35 +356,60 @@ class CorridorEnvironment(gym.Env):
         # Return distance to first wall hit
         return min(intersections)
 
-    def _cast_lidar_ray(self, angle):
+    def get_lidar(self):
+        """Cast all lidar rays at once; same semantics as the per-ray version.
+
+        Distances are capped at ``lidar_range``. ``inf`` marks rays with no
+        hit in a category, so ``np.minimum`` reduces to the first real hit.
+        """
         x, x_dot, y, y_dot = self.dynamics.get_state()
 
-        origin = np.array([x, y])
-
-        direction = np.array([
-            np.cos(angle),
-            np.sin(angle)
-        ])
-
-        min_distance = self.lidar_range
-
-        # Check wall
-        wall_distance = self._ray_wall_intersection(origin, direction)
-        if wall_distance is not None:
-            min_distance = min(min_distance, wall_distance)
-
-        # Check pillars
-        for pillar_x, pillar_y, pillar_radius in self.pillars:
-            center = np.array([pillar_x, pillar_y])
-            pillar_distance = self._ray_circle_intersection(origin, direction, center, pillar_radius)
-            if pillar_distance is not None:
-                min_distance = min(min_distance, pillar_distance)
-
-        return min_distance
-
-    def get_lidar(self):
         angles = np.linspace(0, 2 * np.pi, self.num_lidar_rays, endpoint=False)
-        distances = np.array([self._cast_lidar_ray(angle) for angle in angles])
+        direction_x = np.cos(angles)
+        direction_y = np.sin(angles)
+
+        distances = np.full(self.num_lidar_rays, self.lidar_range, dtype=np.float64)
+
+        # Top/bottom wall, matching _ray_wall_intersection's thresholds.
+        t_wall = np.full(self.num_lidar_rays, np.inf, dtype=np.float64)
+        vertical = np.abs(direction_y) >= 1e-6
+        t_wall[vertical] = (
+            np.where(direction_y[vertical] > 0, self.width / 2, -self.width / 2) - y
+        ) / direction_y[vertical]
+        t_wall[t_wall < 0] = np.inf
+
+        # Left wall at x = 0 (no wall at the goal end).
+        t_left = np.full(self.num_lidar_rays, np.inf, dtype=np.float64)
+        horizontal = np.abs(direction_x) >= 1e-6
+        t_left[horizontal] = (0.0 - x) / direction_x[horizontal]
+        t_left[t_left < 0] = np.inf
+
+        distances = np.minimum(distances, np.minimum(t_wall, t_left))
+
+        # Ray-circle intersections for every (ray, pillar) pair at once.
+        if len(self.pillars) > 0:
+            pillar_x, pillar_y, pillar_radius = self.pillars.T
+            offset_x = x - pillar_x
+            offset_y = y - pillar_y
+
+            b = 2.0 * (
+                direction_x[:, None] * offset_x[None, :]
+                + direction_y[:, None] * offset_y[None, :]
+            )
+            c = offset_x**2 + offset_y**2 - pillar_radius**2
+            discriminant = b**2 - 4.0 * c
+
+            sqrt_discriminant = np.sqrt(np.where(discriminant >= 0, discriminant, 0.0))
+            t1 = (-b - sqrt_discriminant) / 2.0
+            t2 = (-b + sqrt_discriminant) / 2.0
+
+            # Only intersections in front of the sensor count.
+            t1 = np.where((discriminant >= 0) & (t1 >= 0), t1, np.inf)
+            t2 = np.where((discriminant >= 0) & (t2 >= 0), t2, np.inf)
+
+            pillar_distance = np.minimum(t1, t2).min(axis=1)
+            distances = np.minimum(distances, pillar_distance)
+
         return distances
 
     def render(self):
@@ -486,228 +511,3 @@ class CorridorEnvironment(gym.Env):
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
         plt.pause(0.001)
-
-class CorridorEnvironmentSimple():
-    def __init__(
-            self, 
-            dynamics,
-            length=30.0,
-            width=5.0,
-            vehicle_radius=0.2,
-            lidar_range=5.0,
-            num_lidar_rays=64,
-            pillars_positions=None,
-    ):
-        self.dynamics= dynamics
-        self.length = length
-        self.width = width
-
-        self.vehicle_radius = vehicle_radius
-        self.lidar_range = lidar_range
-        self.num_lidar_rays = num_lidar_rays
-        self.pillars_positions = pillars_positions
-        
-        self.pillars = np.array([(8.0, 1.0, 0.5), (14.0, -1.0, 0.5), (20.0, 0.5, 0.5)]) #TODO: Add pillars_positions to make the pillars configurable
-        #self.pillars =  self._add_pillars(self.pillars_positions)
-
-    def reset(self, state=None):
-        self.dynamics.reset(state)    
-
-    def step(self, action):
-        self.dynamics.update(action)
-        
-        collision = self.check_collision()
-
-        observation = self._get_observation()
-
-        return observation, collision
-
-    def _get_observation(self):
-        return np.array(self.dynamics.get_state(), dtype=np.float32)
-
-    def check_collision(self):
-        return (self._check_wall_collision() or self._check_pillar_collision())
-
-    def _check_wall_collision(self):
-        x, x_dot, y, y_dot = self.dynamics.get_state()
-
-        # Side walls
-        if y + self.vehicle_radius >= self.width/2 :
-            return True
-        
-        if y - self.vehicle_radius <= -self.width/2:
-            return True
-
-        return False
-    
-    def _check_pillar_collision(self):
-        x, x_dot, y, y_dot = self.dynamics.get_state()
-
-        for pillar_x, pillar_y, pillar_radius in self.pillars:
-            distance = np.sqrt((x - pillar_x)**2 + (y - pillar_y)**2)
-            if distance <= (self.vehicle_radius + pillar_radius):
-                return True
-        
-        return False
-
-    def _add_pillars(self, pillars_positions=None):
-        if pillars_positions is None:
-            self.pillars = np.array([(8.0, 1.0, 0.5), (14.0, -1.0, 0.5), (20.0, 0.5, 0.5)])
-        else:
-            self.pillars = np.array([(8.0, 1.0, 0.5), (14.0, -1.0, 0.5), (20.0, 0.5, 0.5)])
-            # TODO
-            pass
-    
-    def _ray_circle_intersection(self, ray_origin, ray_direction, circle_center, circle_radius):
-        offset = ray_origin - circle_center
-
-        b = 2.0 * np.dot(ray_direction, offset)
-        c = np.dot(offset, offset) - circle_radius**2
-        
-        discriminant = b**2 - 4.0 * c
-
-        # Ray misses the circle
-        if discriminant < 0:
-            return None
-
-        sqrt_discriminant = np.sqrt(discriminant)
-
-        t1 = (-b - sqrt_discriminant) / 2.0
-        t2 = (-b + sqrt_discriminant) / 2.0
-
-        # Only intersections in front of the sensor count
-        distances = [t for t in (t1, t2) if t >= 0]
-
-        if not distances:
-            return None
-
-        return min(distances)
-
-    def _ray_wall_intersection(self, ray_origin, ray_direction):
-        y = ray_origin[1]
-        dy = ray_direction[1]
-
-        # Ray is parallel to walls
-        if abs(dy) < 1e-6:
-            return None
-
-        if dy > 0:
-            wall_y = self.width / 2
-        else:
-            wall_y = -self.width / 2
-
-        t = (wall_y - y) / dy
-
-        if t < 0:
-            return None
-
-        return t
-
-    def _cast_lidar_ray(self, angle):
-        x, x_dot, y, y_dot = self.dynamics.get_state()
-
-        origin = np.array([x, y])
-
-        direction = np.array([
-            np.cos(angle),
-            np.sin(angle)
-        ])
-
-        min_distance = self.lidar_range
-
-        # Check wall
-        wall_distance = self._ray_wall_intersection(origin, direction)
-        if wall_distance is not None:
-            min_distance = min(min_distance, wall_distance)
-
-        # Check pillars
-        for pillar_x, pillar_y, pillar_radius in self.pillars:
-            center = np.array([pillar_x, pillar_y])
-            pillar_distance = self._ray_circle_intersection(origin, direction, center, pillar_radius)
-            if pillar_distance is not None:
-                min_distance = min(min_distance, pillar_distance)
-
-        return min_distance
-
-    def get_lidar(self):
-        angles = np.linspace(0, 2 * np.pi, self.num_lidar_rays, endpoint=False)
-        distances = np.array([self._cast_lidar_ray(angle) for angle in angles])
-        return distances
-
-    def render(self):
-        x, x_dot, y, y_dot = self.dynamics.get_state()
-
-        fig, ax = plt.subplots(figsize=(12, 4))
-
-        # Corridor walls
-        ax.plot(
-            [0, self.length],
-            [self.width/2, self.width/2],
-            color="black",
-        )
-        ax.plot(
-            [0, self.length],
-            [-self.width/2, -self.width/2],
-            color="black",
-        )
-
-        # Pillars
-        for pillar_x, pillar_y, pillar_radius in self.pillars:
-            pillar = Circle(
-                (pillar_x, pillar_y),
-                pillar_radius,
-                color="gray",
-            )
-            ax.add_patch(pillar)
-
-        # Lidar
-        lidar_distances = self.get_lidar()
-        
-        angles = np.linspace(0, 2 * np.pi, self.num_lidar_rays, endpoint=False)
-
-        for angle, distance in zip(angles, lidar_distances):
-            end_x = x + distance * np.cos(angle)
-            end_y = y + distance * np.sin(angle)
-
-            if distance < self.lidar_range:
-                color = "red"
-                ax.scatter(end_x, end_y, color=color, s=5, zorder=4)
-            else:
-                color = "green"
-
-            ax.plot(
-                [x, end_x],
-                [y, end_y],
-                color=color,
-                alpha=0.3,
-                linewidth=0.8,
-            )
-
-        # Vehicle
-        vehicle = Circle(
-            (x, y),
-            self.vehicle_radius,
-            color="blue",
-        )
-        ax.add_patch(vehicle)
-
-        # Velocity vector
-        ax.arrow(
-            x, y,
-            x_dot, y_dot,
-            head_width=0.15,
-            length_includes_head=True,
-            color="red",
-            zorder=6,
-        )
-
-        # Plot settings
-        ax.set_xlim(0, self.length)
-        ax.set_ylim(-self.width/2 - 1, self.width/2 + 1)
-
-        ax.set_aspect('equal')
-        ax.set_xlabel("x [m]")
-        ax.set_ylabel("y [m]")
-        ax.set_title("Corridor Environment")
-
-        plt.show()
