@@ -4,11 +4,11 @@ import argparse
 
 from agents.td3 import TD3
 from agents.rcrl_td3 import RCRL_TD3
-from double_integrator_sim.dynamics import DoubleIntegratorExactDiscretization
-from double_integrator_sim.environment import CorridorEnvironment
+from environment.dynamics import DoubleIntegratorExactDiscretization
+from environment.environment import CorridorEnvironment
 
 
-def create_env(layout_set):
+def create_env(layout_set, obs_type):
     dynamics = DoubleIntegratorExactDiscretization(
         dt=0.1,
         max_velocity=3.0
@@ -22,12 +22,13 @@ def create_env(layout_set):
         lidar_range=5.0,
         num_lidar_rays=64,
         layout_set=layout_set,
+        obs_type=obs_type,
     )
 
     return env
 
-def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one"):
-    env = create_env(layout_set)
+def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one", obs_type="lidar"):
+    env = create_env(layout_set, obs_type)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -105,6 +106,12 @@ if __name__ == "__main__":
         default="one",
         help="Layout set name; loads layouts/<name>_{train,test,validation}.npy",
     )
+    parser.add_argument(
+        "--obs",
+        choices=("lidar", "state"),
+        default="lidar",
+        help="Observation variant the checkpoint was trained with",
+    )
 
     args = parser.parse_args()
 
@@ -116,4 +123,4 @@ if __name__ == "__main__":
 
     MODEL_PATH = os.path.join("models", args.name, args.agent)
 
-    main(MODEL_PATH, args.agent, args.test_layout, args.layout_set)
+    main(MODEL_PATH, args.agent, args.test_layout, args.layout_set, args.obs)

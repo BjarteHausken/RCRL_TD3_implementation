@@ -234,13 +234,11 @@ class RCRLTD3:
             "safety_loss": safety_loss.item(),
             "mean_constraint": h.mean().item(),
             "mean_safety_value": current_h.detach().mean().item(),
-        }
+            }
 
     def train(self, replay_buffer, batch_size=256):
         self.total_it += 1
-        state, action, next_state, reward, h, next_h, not_done = replay_buffer.sample(
-            batch_size
-        )
+        state, action, next_state, reward, h, next_h, not_done = replay_buffer.sample(batch_size)
 
         with torch.no_grad():
             reward_noise = torch.randn_like(action).mul_(self.policy_noise)

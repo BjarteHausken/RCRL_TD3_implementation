@@ -1,4 +1,8 @@
-"""Train the reachability-constrained TD3 agent in the corridor environment."""
+"""Train the plain TD3 agent in the corridor environment.
+
+Same two-phase schedule and random-start coverage as train_rcrl_td3.py,
+but without the safety critic and multiplier.
+"""
 
 import argparse
 import json
@@ -8,14 +12,13 @@ import random
 import numpy as np
 import torch
 
-from agents.rcrl_td3 import RCRLTD3
 from agents.td3 import TD3
-from double_integrator_sim.dynamics import DoubleIntegratorExactDiscretization
-from double_integrator_sim.environment import CorridorEnvironment
-from utils import ReplayBuffer, ReplayBufferRCRLTD3
+from environment.dynamics import DoubleIntegratorExactDiscretization
+from environment.environment import CorridorEnvironment
+from utils import ReplayBuffer
 
 
-def create_env(layout_set):
+def create_env(layout_set, obs_type):
     dynamics = DoubleIntegratorExactDiscretization(dt=0.1, max_velocity=3.0)
     return CorridorEnvironment(
         dynamics=dynamics,
@@ -25,12 +28,13 @@ def create_env(layout_set):
         lidar_range=5.0,
         num_lidar_rays=64,
         layout_set=layout_set,
+        obs_type=obs_type,
     )
 
 
-def evaluate_policy(policy, layout_set):
+def evaluate_policy(policy, layout_set, obs_type):
     """Evaluate a deterministic policy once on every validation layout."""
-    env = create_env(layout_set)
+    env = create_env(layout_set, obs_type)
     total_reward = 0.0
     total_steps = 0
     successes = 0
@@ -74,9 +78,8 @@ def reset_for_episode(
     """Reset for a new episode; returns (observation, used_random_state).
 
     During the random-exploration phase every episode starts from a random
-    safe state so the critics are trained over a broad slice of the feasible
-    set. In the learning phase, ``fixed`` keeps the standard start and
-    ``mixed`` additionally starts from a random state with probability
+    safe state. In the learning phase, ``fixed`` keeps the standard start
+    and ``mixed`` additionally starts from a random state with probability
     ``random_reset_frac``.
     """
     use_random = random_phase or (
@@ -105,47 +108,27 @@ def set_seed(seed):
 def main(args):
     set_seed(args.seed)
 
-    env = create_env(args.layout_set)
+    env = create_env(args.layout_set, args.obs)
     env.action_space.seed(args.seed)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
 
-    if args.agent == "rcrl_td3":
-        policy = RCRLTD3(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            max_action=max_action,
-            discount=args.discount,
-            tau=args.tau,
-            policy_noise=args.policy_noise,
-            noise_clip=args.noise_clip,
-            policy_freq=args.policy_freq,
-            critic_lr=args.critic_lr,
-            actor_lr=args.actor_lr,
-            safety_lr=args.safety_lr,
-            multiplier_lr=args.multiplier_lr,
-            multiplier_freq=args.multiplier_freq,
-            max_lambda=args.max_lambda,
-            initial_lambda=args.initial_lambda,
-        )
-    else:
-        policy = TD3(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            max_action=max_action,
-            discount=args.discount,
-            tau=args.tau,
-            policy_noise=args.policy_noise,
-            noise_clip=args.noise_clip,
-            policy_freq=args.policy_freq,
-        )
+    policy = TD3(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        max_action=max_action,
+        discount=args.discount,
+        tau=args.tau,
+        policy_noise=args.policy_noise,
+        noise_clip=args.noise_clip,
+        policy_freq=args.policy_freq,
+    )
     if args.random_reset_max_speed > env.dynamics.max_velocity:
         raise ValueError(
             "--random-reset-max-speed must not exceed the dynamics max_velocity"
         )
-    buffer_class = ReplayBufferRCRLTD3 if args.agent == "rcrl_td3" else ReplayBuffer
-    replay_buffer = buffer_class(
+    replay_buffer = ReplayBuffer(
         state_dim=state_dim,
         action_dim=action_dim,
         max_size=args.replay_size,
@@ -153,10 +136,11 @@ def main(args):
 
     run_dir = os.path.join(args.output_dir, args.name)
     os.makedirs(run_dir, exist_ok=True)
-    model_path = os.path.join(run_dir, args.agent)
+    model_path = os.path.join(run_dir, "td3")
     config = vars(args) | {
-        "agent": args.agent,
+        "agent": "td3",
         "layout_set": args.layout_set,
+        "obs_type": args.obs,
         "state_dim": state_dim,
         "action_dim": action_dim,
         "max_action": max_action,
@@ -208,37 +192,19 @@ def main(args):
         episode_reward += reward
 
         # Time-limit truncations retain bootstrap targets; collisions and goals do not.
-        if args.agent == "rcrl_td3":
-            # info["constraint"] is h(s) and info["next_constraint"] is h(s').
-            replay_buffer.add(
-                state,
-                action,
-                next_state,
-                reward,
-                info["constraint"],
-                info["next_constraint"],
-                float(terminated),
-            )
-        else:
-            replay_buffer.add(state, action, next_state, reward, float(terminated))
+        replay_buffer.add(state, action, next_state, reward, float(terminated))
         state = next_state
 
-        if replay_buffer.size >= args.batch_size:
-            if random_phase:
-                # RCRL critic warmup: both critics learn from the broad random
-                # coverage while the actor and multiplier stay frozen. Plain
-                # TD3 only collects transitions during the random phase.
-                if args.agent == "rcrl_td3":
-                    policy.train_warmup(replay_buffer, batch_size=args.batch_size)
-            else:
-                policy.train(replay_buffer, batch_size=args.batch_size)
+        if not random_phase and replay_buffer.size >= args.batch_size:
+            # During the random-exploration phase TD3 only collects transitions;
+            # training starts at --start-timesteps.
+            policy.train(replay_buffer, batch_size=args.batch_size)
 
         if not random_phase and not warmup_announced:
             warmup_announced = True
-            training_name = "full RCRL training" if args.agent == "rcrl_td3" else "TD3 training"
             print(
                 f"Random exploration complete at step {timestep + 1}; "
-                f"{training_name} started"
+                f"TD3 training started"
             )
 
         if terminated or truncated:
@@ -263,25 +229,10 @@ def main(args):
             episode_num += 1
 
         if args.log_freq > 0 and (timestep + 1) % args.log_freq == 0:
-            if args.agent == "rcrl_td3":
-                with torch.no_grad():
-                    multiplier_state = torch.as_tensor(
-                        state.reshape(1, -1),
-                        dtype=torch.float32,
-                        device=next(policy.multiplier.parameters()).device,
-                    )
-                    mean_lambda = policy.multiplier(multiplier_state).item()
-                print(
-                    f"Step {timestep + 1}: replay_size={replay_buffer.size}, "
-                    f"mean_lambda={mean_lambda:.4f}"
-                )
-            else:
-                print(
-                    f"Step {timestep + 1}: replay_size={replay_buffer.size}"
-                )
+            print(f"Step {timestep + 1}: replay_size={replay_buffer.size}")
 
         if args.eval_freq > 0 and (timestep + 1) % args.eval_freq == 0:
-            results = evaluate_policy(policy, args.layout_set)
+            results = evaluate_policy(policy, args.layout_set, args.obs)
             print(
                 f"Evaluation at {timestep + 1}: "
                 f"mean_reward={results['mean_reward']:.3f}, "
@@ -298,20 +249,19 @@ def main(args):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", required=True, help="Run directory name")
-    parser.add_argument(
-        "--agent",
-        choices=("rcrl_td3", "td3"),
-        default="rcrl_td3",
-        help="Agent to train: 'rcrl_td3' adds the reachability safety "
-             "constraint, 'td3' trains the plain reward agent. Checkpoints "
-             "are saved under models/<name>/<agent>/ and load with the "
-             "matching --agent in the evaluate scripts",
-    )
     parser.add_argument("--output-dir", default="models", help="Checkpoint root")
     parser.add_argument(
         "--layout-set",
         default="one",
         help="Layout set name; loads layouts/<name>_{train,test,validation}.npy",
+    )
+    parser.add_argument(
+        "--obs",
+        choices=("lidar", "state"),
+        default="lidar",
+        help="Observation variant: 'lidar' = velocity + 64 lidar rays; "
+             "'state' = [x, x_dot, y, y_dot] + all pillar positions "
+             "(ablation with perfect obstacle knowledge, no sensing)",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-timesteps", type=int, default=30_000)
@@ -324,13 +274,6 @@ def parse_args():
     parser.add_argument("--policy-noise", type=float, default=0.2)
     parser.add_argument("--noise-clip", type=float, default=0.5)
     parser.add_argument("--policy-freq", type=int, default=2)
-    parser.add_argument("--critic-lr", type=float, default=1e-4)
-    parser.add_argument("--actor-lr", type=float, default=2e-5)
-    parser.add_argument("--safety-lr", type=float, default=1e-4)
-    parser.add_argument("--multiplier-lr", type=float, default=1e-6)
-    parser.add_argument("--multiplier-freq", type=int, default=6)
-    parser.add_argument("--max-lambda", type=float, default=100.0)
-    parser.add_argument("--initial-lambda", type=float, default=0.1)
     parser.add_argument(
         "--reset-mode",
         choices=["fixed", "mixed"],
@@ -361,11 +304,6 @@ def parse_args():
         parser.error("--replay-size must be at least --batch-size, both positive")
     if args.policy_freq < 1:
         parser.error("--policy-freq must be positive")
-    if args.agent == "rcrl_td3":
-        if args.multiplier_freq < args.policy_freq:
-            parser.error("--multiplier-freq must be at least --policy-freq")
-        if args.max_lambda <= 0 or not 0 < args.initial_lambda <= args.max_lambda:
-            parser.error("--initial-lambda must be in (0, --max-lambda]")
     if not 0 <= args.random_reset_frac <= 1:
         parser.error("--random-reset-frac must be in [0, 1]")
     if args.random_reset_margin < 0:

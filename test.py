@@ -1,6 +1,6 @@
 import numpy as np
-from double_integrator_sim.dynamics import DoubleIntegratorExactDiscretization
-from double_integrator_sim.environment import CorridorEnvironment
+from environment.dynamics import DoubleIntegratorExactDiscretization
+from environment.environment import CorridorEnvironment
 from gymnasium.utils.env_checker import check_env
 
 dynamics = DoubleIntegratorExactDiscretization(dt=0.1, max_velocity=5.0)

@@ -13,7 +13,7 @@ The RCRL implementation is an adaptation, not a reproduction, of the paper's exp
 agents/
   td3.py                     Plain TD3 (original implementation)
   rcrl_td3.py                TD3 + RCRL safety critic, statewise multiplier
-double_integrator_sim/
+environment/
   dynamics.py                Exact double-integrator discretization (dt = 0.1 s)
   environment.py             Gymnasium corridor environment
   layouts/generate_layouts.py  Random pillar-layout generator
@@ -21,8 +21,9 @@ double_integrator_sim/
 layouts/                     Layout sets: <set>_{train,test,validation}.npy
 models/                      Training runs (checkpoints + config.json)
 utils.py                     Replay buffers (plain, and RCRL with h/h')
-train_rcrl_td3.py            Main trainer (RCRL or TD3 via --agent)
-train_td3.py                 Standalone TD3 trainer (legacy, fixed constants)
+train_scripts/
+  train_rcrl_td3.py          Trainer for the RCRL agent
+  train_td3.py               Trainer for the plain TD3 baseline
 evaluate_td3.py              Headless evaluation over all test layouts
 evaluate_td3_visual.py       Rendered single-episode evaluation
 test.py                      Environment checks (gymnasium check_env, margins)
@@ -54,38 +55,42 @@ A corridor of length 30 m and width 5 m with cylindrical pillars (radius 0.5 m) 
 
 The state constraint is `h(s) = vehicle_radius - min(lidar_distances)`, where `vehicle_radius = 0.2 m`; see [Constraint convention](#constraint-convention).
 
+An observation ablation is available with `--obs state` (default is `--obs lidar`): instead of the 64 lidar rays, the observation is `[x, x_dot, y, y_dot]` plus the `(x, y)` of every pillar — perfect obstacle knowledge with no local sensing (16-dim for the `one` layout set). The constraint is still computed from internal lidar sensing, so both variants run the same constraint logic. The observation variant is recorded in `config.json`, and evaluation must use the same `--obs` the checkpoint was trained with.
+
 ## Layouts
 
 Pillar layouts live in `layouts/` as `<set>_{train,test,validation}.npy`, each an array of `(x, y, radius)` pillars per layout (the default `one` set has 30 train, 10 test, and 10 validation layouts). Generate a new set with:
 
 ```bash
-python double_integrator_sim/layouts/generate_layouts.py --name myset --num-pillars 6
+python environment/layouts/generate_layouts.py --name myset --num-pillars 6
 ```
 
 All training and evaluation scripts select the set with `--layout-set` (default `one`); the set name is recorded in each run's `config.json`, so a checkpoint should be evaluated with the same `--layout-set` it was trained on.
 
 ## Run training
 
+Run from the repository root as a module:
+
 ```bash
-python train_rcrl_td3.py --name my_rcrl_run
+python -m train_scripts.train_rcrl_td3 --name my_rcrl_run
 ```
 
-The same script trains the plain TD3 baseline (same two-phase schedule and
-random-start coverage, but no safety critic or multiplier) with `--agent td3`:
+The plain TD3 baseline (same two-phase schedule and random-start coverage,
+but no safety critic or multiplier) has its own trainer:
 
 ```bash
-python train_rcrl_td3.py --name my_td3_run --agent td3
+python -m train_scripts.train_td3 --name my_td3_run
 ```
 
 For a small end-to-end check:
 
 ```bash
-python train_rcrl_td3.py --name rcrl_smoke --max-timesteps 8 \
+python -m train_scripts.train_rcrl_td3 --name rcrl_smoke --max-timesteps 8 \
   --start-timesteps 0 --batch-size 2 --replay-size 32 \
   --eval-freq 0 --log-freq 1 --output-dir /tmp/rcrl_runs
 ```
 
-Checkpoints are written under `models/<name>/` with the agent name as prefix (`rcrl_td3` or `td3`); the agent is recorded in `config.json`. `train_td3.py` is a legacy standalone TD3 trainer with fixed module-level constants; `train_rcrl_td3.py --agent td3` is its configurable replacement.
+Checkpoints are written under `models/<name>/` with the agent name as prefix (`rcrl_td3` or `td3`); the agent is recorded in `config.json`.
 
 ## Evaluation
 
@@ -101,7 +106,7 @@ python evaluate_td3_visual.py --name my_rcrl_run --agent rcrl_td3
 ## Manual control and tests
 
 ```bash
-python double_integrator_sim/manual_control.py   # drive manually (needs a display)
+python environment/manual_control.py   # drive manually (needs a display)
 python test.py                                   # check_env, random-state margins, custom reset
 ```
 
