@@ -3,28 +3,8 @@ import argparse
 
 from agents.td3 import TD3
 from agents.rcrl_td3 import RCRL_TD3
-from environment.dynamics import DoubleIntegratorExactDiscretization
-from environment.environment import CorridorEnvironment
+from environment import create_env
 
-
-def create_env(layout_set, obs_type):
-    dynamics = DoubleIntegratorExactDiscretization(
-        dt=0.1,
-        max_velocity=3.0
-    )
-
-    env = CorridorEnvironment(
-        dynamics=dynamics,
-        length=30.0,
-        width=5.0,
-        max_acceleration=2.0,
-        lidar_range=5.0,
-        num_lidar_rays=64,
-        layout_set=layout_set,
-        obs_type=obs_type,
-    )
-
-    return env
 
 def main(MODEL_PATH, agent_type="td3", layout_set="one", obs_type="lidar"):
     env = create_env(layout_set, obs_type)
@@ -38,10 +18,17 @@ def main(MODEL_PATH, agent_type="td3", layout_set="one", obs_type="lidar"):
     policy.load(MODEL_PATH)
     print("Loaded model:", MODEL_PATH)
 
+    # Same metrics as the in-training evaluation.
     successes = 0
+    collisions = 0
+    total_reward = 0.0
+    total_steps = 0
 
     for layout_idx in range(len(env.test_layouts)):
         state, info = env.reset(layout_type="test", layout_index=layout_idx)
+
+        episode_reward = 0.0
+        episode_steps = 0
 
         while True:
             # IMPORTANT: No exploration noise during evaluation
@@ -49,23 +36,32 @@ def main(MODEL_PATH, agent_type="td3", layout_set="one", obs_type="lidar"):
             next_state, reward, terminated, truncated, info = env.step(action)
 
             state = next_state
+            episode_reward += reward
+            episode_steps += 1
 
             if terminated or truncated:
                 break
 
+        successes += int(info["goal_reached"])
+        collisions += int(info["collision"])
+        total_reward += episode_reward
+        total_steps += episode_steps
+
         print(
             f"Layout {layout_idx}: "
             f"goal={info['goal_reached']} "
-            f"collision={info['collision']}"
+            f"collision={info['collision']} "
+            f"reward={episode_reward:.1f} "
+            f"steps={episode_steps}"
         )
 
-        if info["goal_reached"]:
-            successes += 1
-
+    num_layouts = len(env.test_layouts)
     print()
     print(
-        f"Success rate: "
-        f"{successes}/{len(env.test_layouts)}"
+        f"Success rate: {successes}/{num_layouts} | "
+        f"Mean reward: {total_reward / num_layouts:.2f} | "
+        f"Mean steps: {total_steps / num_layouts:.1f} | "
+        f"Collision rate: {collisions / num_layouts:.1%}"
     )
 
 if __name__ == "__main__":

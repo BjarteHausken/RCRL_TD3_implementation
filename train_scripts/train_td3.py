@@ -13,23 +13,8 @@ import numpy as np
 import torch
 
 from agents.td3 import TD3
-from environment.dynamics import DoubleIntegratorExactDiscretization
-from environment.environment import CorridorEnvironment
+from environment import create_env
 from utils import ReplayBuffer
-
-
-def create_env(layout_set, obs_type):
-    dynamics = DoubleIntegratorExactDiscretization(dt=0.1, max_velocity=3.0)
-    return CorridorEnvironment(
-        dynamics=dynamics,
-        length=30.0,
-        width=5.0,
-        max_acceleration=2.0,
-        lidar_range=5.0,
-        num_lidar_rays=64,
-        layout_set=layout_set,
-        obs_type=obs_type,
-    )
 
 
 def evaluate_policy(policy, layout_set, obs_type):

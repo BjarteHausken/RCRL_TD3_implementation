@@ -31,8 +31,8 @@ import numpy as np
 import torch
 
 from agents.rcrl_td3 import RCRLTD3, device
+from environment import create_env
 from train_scripts.train_rcrl_td3 import (
-    create_env,
     evaluate_policy,
     reset_for_episode,
     set_seed,

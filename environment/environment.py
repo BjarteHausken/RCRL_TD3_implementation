@@ -18,6 +18,7 @@ class CorridorEnvironment(gym.Env):
             pillars_positions=None,
             layout_set="one",
             obs_type="lidar",
+            max_steps=1000,
     ):
         super().__init__()
         if obs_type not in ("lidar", "state"):
@@ -32,7 +33,7 @@ class CorridorEnvironment(gym.Env):
         self.num_lidar_rays = num_lidar_rays
         self.pillars_positions = pillars_positions
         self.max_acceleration = max_acceleration
-        self.max_steps = 1000
+        self.max_steps = max_steps
         self.current_step = 0
         
         self.train_layouts = np.load(f"layouts/{layout_set}_train.npy")
