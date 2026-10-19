@@ -7,7 +7,7 @@ from gymnasium import spaces
 
 class CorridorEnvironment(gym.Env):
     def __init__(
-            self, 
+            self,
             dynamics,
             length=30.0,
             width=5.0,
@@ -17,13 +17,12 @@ class CorridorEnvironment(gym.Env):
             max_acceleration=1.0,
             pillars_positions=None,
             layout_set="one",
-            obs_type="lidar",
+            goal_radius=0.5,
             max_steps=1000,
+            normalize_obs=True,
     ):
         super().__init__()
-        if obs_type not in ("lidar", "state"):
-            raise ValueError("obs_type must be 'lidar' or 'state'")
-        self.obs_type = obs_type
+        self.normalize_obs = normalize_obs
 
         self.dynamics= dynamics
         self.length = length
@@ -33,8 +32,10 @@ class CorridorEnvironment(gym.Env):
         self.num_lidar_rays = num_lidar_rays
         self.pillars_positions = pillars_positions
         self.max_acceleration = max_acceleration
+        self.goal_radius = goal_radius
         self.max_steps = max_steps
         self.current_step = 0
+        self.goal = None
         
         self.train_layouts = np.load(f"layouts/{layout_set}_train.npy")
         self.test_layouts = np.load(f"layouts/{layout_set}_test.npy")
@@ -51,66 +52,40 @@ class CorridorEnvironment(gym.Env):
         
         max_velocity = self.dynamics.max_velocity
 
-        if obs_type == "lidar":
-            state_low = np.array([
-                -max_velocity,
-                -max_velocity,
-            ], dtype=np.float32)
+        # [x_dot, y_dot, lidar distances, goal_x - x, goal_y - y]
+        obs_low = np.concatenate((
+            np.full(2, -max_velocity, dtype=np.float32),
+            np.zeros(self.num_lidar_rays, dtype=np.float32),
+            np.array([-self.length, -self.width], dtype=np.float32),
+        ))
+        obs_high = np.concatenate((
+            np.full(2, max_velocity, dtype=np.float32),
+            np.full(self.num_lidar_rays, self.lidar_range, dtype=np.float32),
+            np.array([self.length, self.width], dtype=np.float32),
+        ))
+        obs_scale = np.concatenate((
+            np.full(2, max_velocity, dtype=np.float32),
+            np.full(self.num_lidar_rays, self.lidar_range, dtype=np.float32),
+            np.array([self.length, self.width], dtype=np.float32),
+        ))
 
-            state_high = np.array([
-                max_velocity,
-                max_velocity,
-            ], dtype=np.float32)
-
-            lidar_low = np.zeros(
-                self.num_lidar_rays,
-                dtype=np.float32,
-            )
-
-            lidar_high = np.full(
-                self.num_lidar_rays,
-                self.lidar_range,
-                dtype=np.float32,
-            )
-
-            self.observation_space = spaces.Box(
-                low=np.concatenate((state_low, lidar_low)),
-                high=np.concatenate((state_high, lidar_high)),
-                dtype=np.float32,
-            )
-        else:
-            # [x, x_dot, y, y_dot, (pillar_x, pillar_y) pairs]
-            half_width = self.width / 2
-            pillar_low = np.tile(
-                np.array([0.0, -half_width], dtype=np.float32), len(self.pillars)
-            )
-            pillar_high = np.tile(
-                np.array([self.length, half_width], dtype=np.float32), len(self.pillars)
-            )
-            self.observation_space = spaces.Box(
-                low=np.concatenate((
-                    np.array(
-                        [-self.length, -max_velocity, -half_width, -max_velocity],
-                        dtype=np.float32,
-                    ),
-                    pillar_low,
-                )),
-                high=np.concatenate((
-                    np.array(
-                        [self.length + max_velocity, max_velocity,
-                         half_width, max_velocity],
-                        dtype=np.float32,
-                    ),
-                    pillar_high,
-                )),
-                dtype=np.float32,
-            )
+        # Fixed per-component scaling: velocities by the speed limit,
+        # distances by the lidar range, positions by the corridor extents,
+        # so every observation component lands in roughly [-1, 1] / [0, 1].
+        self.obs_scale = obs_scale
+        if normalize_obs:
+            obs_low = obs_low / obs_scale
+            obs_high = obs_high / obs_scale
+        self.observation_space = spaces.Box(
+            low=obs_low, high=obs_high, dtype=np.float32
+        )
         
         # Figure
         self.fig = None
         self.ax = None
 
-    def reset(self, *, layout_type="fixed", seed=None, options=None, state=None, layout_index=None):
+    def reset(self, *, layout_type="fixed", seed=None, options=None, state=None,
+              layout_index=None, goal=None):
         """Reset the environment.
 
         ``layout_type`` selects the layout set to load ("train", "test",
@@ -118,7 +93,9 @@ class CorridorEnvironment(gym.Env):
         ``layout_index`` is None, a layout is chosen uniformly at random
         from the selected set, otherwise that specific layout is loaded.
         ``state`` optionally sets the initial dynamics state
-        (x, x_dot, y, y_dot).
+        (x, x_dot, y, y_dot). ``goal`` optionally sets the goal position
+        (x, y) or a goal state (x, x_dot, y, y_dot); when omitted, a new
+        random feasible goal is sampled for the loaded layout.
         """
         super().reset(seed=seed)
 
@@ -131,6 +108,16 @@ class CorridorEnvironment(gym.Env):
             if layout_index is None:
                 layout_index = self.np_random.integers(len(layouts[layout_type]))
             self.pillars = layouts[layout_type][layout_index].copy()
+
+        if goal is None:
+            goal = self.sample_random_state(margin=0.3, max_speed=0.0)
+        goal_state = np.asarray(goal, dtype=np.float64).reshape(-1)
+        if goal_state.size >= 4:
+            # (x, x_dot, y, y_dot) state
+            self.goal = np.array([goal_state[0], goal_state[2]], dtype=np.float64)
+        else:
+            # (x, y) position
+            self.goal = np.array([goal_state[0], goal_state[1]], dtype=np.float64)
 
         if state is None:
             self.dynamics.reset()
@@ -191,14 +178,15 @@ class CorridorEnvironment(gym.Env):
         )
 
     def step(self, action):
-        old_x = self.dynamics.get_state()[0]
+        old_x, _, old_y, _ = self.dynamics.get_state()
+        old_goal_distance = np.hypot(old_x - self.goal[0], old_y - self.goal[1])
 
         # Constraint of the current state, before the action is applied.
         constraint = self._get_lidar_constraint()
 
         # Make sure action obeys acceleration limits
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        
+
         acceleration = action * self.max_acceleration
 
         # Apply double-integrator dynamics
@@ -208,10 +196,11 @@ class CorridorEnvironment(gym.Env):
 
         # Get new state
         x, x_dot, y, y_dot = self.dynamics.get_state()
+        new_goal_distance = np.hypot(x - self.goal[0], y - self.goal[1])
 
         # Check environment conditions
         collision = self.check_collision()
-        goal_reached = x >= self.length
+        goal_reached = new_goal_distance <= self.goal_radius
 
         # Episode termination
         terminated = collision or goal_reached
@@ -222,15 +211,9 @@ class CorridorEnvironment(gym.Env):
         # Observation AFTER action
         observation = self._get_observation()
 
-        # Temporary reward
-        #reward = x - old_x
-        # Time-optimal reward
-        #reward = -1.0
-        #if goal_reached:
-        #    reward += 50.0
-
-        # Compromise reward
-        reward = 5.0 * (x - old_x) - 0.1
+        # Reach-the-goal reward: closer to the goal is better, on top of a
+        # small per-step cost, with a bonus for reaching the goal.
+        reward = 5.0 * (old_goal_distance - new_goal_distance) - 0.1
         if goal_reached:
             reward += 50.0
 
@@ -255,17 +238,18 @@ class CorridorEnvironment(gym.Env):
     def _get_observation(self):
         x, x_dot, y, y_dot = self.dynamics.get_state()
 
-        if self.obs_type == "lidar":
-            velocity = np.array([x_dot, y_dot], dtype=np.float32)
-            lidar = np.array(self.get_lidar(), dtype=np.float32)
-            return np.concatenate((velocity, lidar))
+        velocity = np.array([x_dot, y_dot], dtype=np.float32)
+        lidar = np.array(self.get_lidar(), dtype=np.float32)
+        # Relative goal coordinates tell the policy where the goal is.
+        goal_relative = np.array([
+            self.goal[0] - x,
+            self.goal[1] - y,
+        ], dtype=np.float32)
+        observation = np.concatenate((velocity, lidar, goal_relative))
 
-        # State ablation: full dynamics state plus every pillar's (x, y).
-        pillar_coords = self.pillars[:, :2].reshape(-1).astype(np.float32)
-        return np.concatenate((
-            np.array([x, x_dot, y, y_dot], dtype=np.float32),
-            pillar_coords,
-        ))
+        if self.normalize_obs:
+            observation = observation / self.obs_scale
+        return observation
 
     def _get_lidar_constraint(self):
         lidar = self.get_lidar()
@@ -455,6 +439,14 @@ class CorridorEnvironment(gym.Env):
                 color="gray",
             )
             ax.add_patch(pillar)
+
+        # Goal
+        goal = Circle(
+            (self.goal[0], self.goal[1]),
+            self.goal_radius,
+            color="green",
+        )
+        ax.add_patch(goal)
 
         # Lidar
         lidar_distances = self.get_lidar()

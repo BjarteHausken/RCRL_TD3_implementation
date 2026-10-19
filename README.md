@@ -1,6 +1,6 @@
 # RCRL-TD3
 
-Reinforcement learning for a double-integrator agent that navigates a pillar-filled corridor from a start wall to a goal wall, avoiding collisions with walls and pillars. The repository contains:
+Reinforcement learning for a double-integrator agent that navigates a pillar-filled corridor from a random start to a random goal, reaching the goal as fast as possible while avoiding collisions with walls and pillars. The repository contains:
 
 - a **TD3 baseline** that maximizes a progress-based reward, and
 - an **RCRL (Reachability Constrained Reinforcement Learning) agent** that learns the same reward while explicitly learning a reachability safety value, so collision avoidance comes from the learned constraint rather than from reward shaping alone.
@@ -12,7 +12,7 @@ The RCRL implementation is an adaptation, not a reproduction, of the paper's exp
 ```text
 agents/
   td3.py                     Plain TD3 (original implementation)
-  rcrl_td3.py                TD3 + RCRL safety critic, statewise multiplier
+  rcrl_td3.py                TD3 + RCRL safety critic, statewise or fixed-scalar multiplier
 environment/
   __init__.py                create_env factory (standard corridor parameters)
   dynamics.py                Exact double-integrator discretization (dt = 0.1 s)
@@ -45,20 +45,22 @@ All commands below run from the repository root.
 
 ## Environment
 
-A corridor of length 30 m and width 5 m with cylindrical pillars (radius 0.5 m) placed between the start and goal walls.
+A corridor of length 30 m and width 5 m with cylindrical pillars (radius 0.5 m). The agent starts at a random position and must reach a randomly placed goal.
 
 | | |
 | --- | --- |
 | Dynamics | double integrator, `dt = 0.1 s`, speed clamped at 3.0 m/s |
 | Action | 2D acceleration command, clipped to ±2.0 m/s² |
-| Observation | velocity (2) + 64 lidar rays of 5.0 m range → 66-dim |
-| Termination | wall/pillar collision, or goal reached (`x >= length`) |
+| Observation | velocity (2) + 64 lidar rays of 5.0 m range + goal-relative coordinates (2) → 68-dim |
+| Termination | wall/pillar collision, or goal reached (distance to goal `<= goal_radius = 0.5 m`) |
 | Truncation | 1000-step time limit (bootstrapped; configurable via `max_steps`) |
-| Reward | `5 * Δx - 0.1` per step, +50 on reaching the goal |
+| Reward | `5 * (d_old - d_new) - 0.1` per step (`d` = distance to the goal), +50 on reaching the goal |
 
 The state constraint is `h(s) = vehicle_radius - min(lidar_distances)`, where `vehicle_radius = 0.2 m`; see [Constraint convention](#constraint-convention).
 
-An observation ablation is available with `--obs state` (default is `--obs lidar`): instead of the 64 lidar rays, the observation is `[x, x_dot, y, y_dot]` plus the `(x, y)` of every pillar — perfect obstacle knowledge with no local sensing (16-dim for the `one` layout set). The constraint is still computed from internal lidar sensing, so both variants run the same constraint logic. The observation variant is recorded in `config.json`, and evaluation must use the same `--obs` the checkpoint was trained with.
+The goal is a point inside the corridor (see [Randomized episodes](#randomized-episodes)); the agent perceives it only through the two relative goal coordinates `(goal_x - x, goal_y - y)`, which are the last two components of the observation.
+
+**Observation normalization (on by default).** Each observation component is divided by its known range: velocities by the 3.0 m/s speed limit, lidar distances by the 5.0 m range, and the goal-relative coordinates by the corridor dimensions (30 m / 5 m). Every component then lands in roughly `[-1, 1]` or `[0, 1]`. The scaling is fixed — no learned or running statistics — so training, evaluation, and manual control always see the same input, and the observation space bounds reflect it. Disable it with `--no-normalize-obs` in any trainer or evaluation script; the choice is recorded in `config.json`, and a checkpoint must be evaluated with the same setting it was trained with.
 
 ## Layouts
 
@@ -78,8 +80,14 @@ Run from the repository root as a module:
 python -m train_scripts.train_rcrl_td3 --name my_rcrl_run
 ```
 
-The plain TD3 baseline (same two-phase schedule and random-start coverage,
-but no safety critic or multiplier) has its own trainer:
+To use a single fixed Lagrange multiplier instead of the statewise `lambda(s)` network, pass `--multiplier scalar` and set its value with `--initial-lambda`:
+
+```bash
+python -m train_scripts.train_rcrl_td3 --name my_rcrl_scalar --multiplier scalar --initial-lambda 0.5
+```
+
+The plain TD3 baseline (same randomized start+goal episode regime, but no
+safety critic or multiplier) has its own trainer:
 
 ```bash
 python -m train_scripts.train_td3 --name my_td3_run
@@ -110,8 +118,8 @@ For a small end-to-end check:
 
 ```bash
 python -m train_scripts.train_rcrl_td3 --name rcrl_smoke --max-timesteps 8 \
-  --start-timesteps 0 --batch-size 2 --replay-size 32 \
-  --eval-freq 0 --log-freq 1 --output-dir /tmp/rcrl_runs
+  --batch-size 2 --replay-size 32 --eval-freq 0 --log-freq 1 \
+  --output-dir /tmp/rcrl_runs
 ```
 
 Checkpoints are written under `models/<name>/` with the agent name as prefix (`rcrl_td3` or `td3`); the agent is recorded in `config.json`.
@@ -125,7 +133,9 @@ python evaluate_td3.py --name my_rcrl_run --agent rcrl_td3
 python evaluate_td3_visual.py --name my_rcrl_run --agent rcrl_td3
 ```
 
-`evaluate_td3.py` reports per-layout outcomes and the same aggregates as the in-training evaluation: mean reward, mean steps, success rate, and collision rate.
+`evaluate_td3.py` reports per-layout outcomes and the same aggregates as the in-training evaluation: mean reward, mean steps, success rate, and collision rate. Each test layout gets one sampled feasible start and one sampled feasible goal — the same randomized regime as training — seeded by the layout index, so evaluation runs are reproducible.
+
+For `--agent rcrl_td3`, the evaluation scripts read the run's `config.json` to reconstruct the exact agent (in particular `--multiplier`), so a checkpoint loads against the same network structure it was saved with.
 
 `evaluate_td3_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout.
 
@@ -133,7 +143,7 @@ python evaluate_td3_visual.py --name my_rcrl_run --agent rcrl_td3
 
 ```bash
 python environment/manual_control.py   # drive manually (needs a display)
-python test.py                                   # check_env, random-state margins, custom reset
+python test.py                                   # check_env, random-state margins, goal termination/reward
 ```
 
 `test.py` is an exploratory script (not a pytest suite). Re-run it when changing environment behavior.
@@ -180,20 +190,24 @@ A predicted unsafe value is positive, so it increases the actor loss. A ReLU or 
 
 `MultiplierNetwork` produces `lambda(s)`, rather than one global penalty. It uses Softplus to remain nonnegative and clips its output to `--max-lambda`. The multiplier is updated by gradient ascent on `lambda(s) Q_h(s, pi(s))`, implemented as minimization of its negative with the actor and safety critic detached. Thus it grows at states predicted to be unsafe and stays bounded for infeasible states.
 
+`--multiplier scalar` replaces the network with a single fixed Lagrange multiplier shared by all states. It is set by `--initial-lambda` and never updated during training (so `--multiplier-lr` and `--multiplier-freq` have no effect in this mode), and the value is recorded in `config.json` like any other hyperparameter.
+
 ### 4. Separate update time scales
 
-The reward critic and safety critic update every gradient step. The actor updates every `--policy-freq` steps (default 2), and the multiplier every `--multiplier-freq` steps (default 6). The default learning rates also make critic/safety updates faster than actor updates, and multiplier updates slowest:
+The reward critic and safety critic update every gradient step. The actor updates every `--policy-freq` steps (default 2), and the statewise multiplier every `--multiplier-freq` steps (default 6, network mode only). Every gradient step clips the global gradient norm of its network to `--grad-clip` (default `1.0`; `0` disables clipping). The default learning rates also make critic/safety updates faster than actor updates, and multiplier updates slowest:
 
 | Option | Default | Purpose |
 | --- | ---: | --- |
 | `--critic-lr` | `1e-4` | TD3 reward-critic learning rate |
 | `--safety-lr` | `1e-4` | reachability safety-critic learning rate |
 | `--actor-lr` | `2e-5` | policy learning rate |
+| `--grad-clip` | `1.0` | max global gradient norm for all networks (`0` disables) |
 | `--multiplier-lr` | `1e-6` | statewise dual-ascent learning rate |
 | `--policy-freq` | `2` | actor/target update interval |
 | `--multiplier-freq` | `6` | multiplier update interval |
 | `--max-lambda` | `100` | upper multiplier bound |
-| `--initial-lambda` | `0.1` | initial multiplier output |
+| `--initial-lambda` | `0.1` | initial multiplier output; the fixed value in `--multiplier scalar` mode |
+| `--multiplier` | `network` | `network` for the statewise `lambda(s)` network, `scalar` for one fixed multiplier |
 
 ### 5. Preserve stable TD3 reward learning
 
@@ -203,32 +217,30 @@ The reward critic remains TD3: twin Q-functions, clipped target-policy noise, de
 target = tau * online + (1 - tau) * target
 ```
 
-The actor, reward critic, safety critic, multiplier, and each optimizer are saved in every RCRL checkpoint. Older actor/reward-only checkpoints can still be loaded for evaluation, but they cannot faithfully resume RCRL training.
+The actor, reward critic, safety critic, and each optimizer are saved in every RCRL checkpoint; in `--multiplier network` mode the multiplier network and its optimizer are saved as well (the fixed scalar needs no checkpoint file, it lives in `config.json`).
 
-## Feasible-set coverage (random resets and critic warmup)
+## Randomized episodes
 
-RCRL imposes its constraint on the states in the support of the initial-state distribution (Prop. 4.1 of the paper), and the dual update only learns `lambda(s)` for states that appear in the replay buffer. With only the fixed start, that support is a single point. On top of that, the time-based reward pushes the agent toward the fastest trajectories, which hug the feasible-set boundary, so the interior of the feasible set (where `V_h` should stay `<= 0`) is underrepresented.
+RCRL imposes its constraint on the states in the support of the initial-state distribution (Prop. 4.1 of the paper), and the dual update only learns `lambda(s)` for states that appear in the replay buffer. Every episode therefore starts from a randomly sampled state, so the policy and the safety value are trained over the feasible set as a whole instead of from a single fixed start.
 
-Training is therefore split into two phases:
+Each episode samples:
 
-1. **Random-exploration phase** (`t < --start-timesteps`, default 10000 steps): random actions, and every episode starts from a random safe state. During this phase the reward critic and safety critic are trained (`RCRLTD3.train_warmup`) while the actor and multiplier stay frozen, so `Q_h` is learned over a broad slice of the feasible set before the reward-driven policy starts, at no extra time cost.
-2. **Learning phase** (`t >= --start-timesteps`): the policy with exploration noise runs from the standard start (the deployment scenario) with full RCRL training.
+1. a **layout** uniformly from the training layouts,
+2. a **start state** via `CorridorEnvironment.sample_random_state` — a position with `vehicle_radius + margin` clearance from the walls and `pillar_radius + vehicle_radius + margin` clearance from every pillar, and a velocity drawn uniformly from a disk of radius `--random-reset-max-speed`, and
+3. a **goal** sampled the same way (with zero velocity), resampled until it is at least `2 * goal_radius` away from the start.
+
+Full RCRL training runs from step 0 — there is no separate exploration or warm-up phase; exploration comes from the per-step action noise (`--expl-noise`).
 
 | Option | Default | Purpose |
 | --- | ---: | --- |
-| `--start-timesteps` | `10_000` | length of the random-exploration (critic warmup) phase |
-| `--reset-mode` | `fixed` | learning-phase episode starts: `fixed` keeps the standard start; `mixed` starts each episode from a random state with probability `--random-reset-frac` |
-| `--random-reset-frac` | `0.15` | probability of a random start in `mixed` mode |
-| `--random-reset-margin` | `0.3` | extra clearance (m) beyond the collision boundary for random start states |
-| `--random-reset-max-speed` | `1.0` | maximum initial speed (m/s) for random start states |
+| `--random-reset-margin` | `0.3` | extra clearance (m) beyond the collision boundary for sampled start and goal states |
+| `--random-reset-max-speed` | `1.0` | maximum speed (m/s) of the sampled start velocity |
 
-Random start states are sampled by `CorridorEnvironment.sample_random_state`, which draws positions uniformly from the corridor while keeping `vehicle_radius + margin` clearance from the walls and `pillar_radius + vehicle_radius + margin` clearance from every pillar, and draws the velocity uniformly from a disk of radius `--random-reset-max-speed`.
-
-The defaults already include the coverage mechanism, so the fastest-to-goal objective is covered by the plain command `python train_rcrl_td3.py --name my_rcrl_run`. Use `--reset-mode mixed` to keep injecting random starts during the learning phase (e.g. to maintain constraint data over the wider state set once the base policy has converged). Evaluation always uses the fixed deployment start.
+Evaluation follows the same regime: one sampled start and one sampled goal per test layout, seeded by layout index for reproducibility.
 
 ## Important limits
 
-RCRL's formal guarantees assume a deterministic Markov decision process, exact multi-time-scale updates, bounded/projection-compatible parameterizations, and an initial-state distribution that covers the largest feasible set (see [Feasible-set coverage](#feasible-set-coverage-random-resets-and-critic-warmup) for the training options that widen this distribution). This corridor experiment uses neural networks, finite replay training, and observations made from velocity plus lidar rather than the full physical state. Treat success and collision rates as empirical evidence, not a formal persistent-safety guarantee.
+RCRL's formal guarantees assume a deterministic Markov decision process, exact multi-time-scale updates, bounded/projection-compatible parameterizations, and an initial-state distribution that covers the largest feasible set (the randomized episode starts in [Randomized episodes](#randomized-episodes) widen this distribution). This corridor experiment uses neural networks, finite replay training, and observations made from velocity plus lidar rather than the full physical state. Treat success and collision rates as empirical evidence, not a formal persistent-safety guarantee.
 
 The actor has no runtime safety filter. It returns its learned action directly, so safety depends on the learned safety critic and the data encountered during training.
 

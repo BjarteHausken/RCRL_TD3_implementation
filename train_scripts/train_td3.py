@@ -1,7 +1,7 @@
 """Train the plain TD3 agent in the corridor environment.
 
-Same two-phase schedule and random-start coverage as train_rcrl_td3.py,
-but without the safety critic and multiplier.
+Same randomized start+goal episode regime as train_rcrl_td3.py, but
+without the safety critic and multiplier.
 """
 
 import argparse
@@ -17,16 +17,27 @@ from environment import create_env
 from utils import ReplayBuffer
 
 
-def evaluate_policy(policy, layout_set, obs_type):
-    """Evaluate a deterministic policy once on every validation layout."""
-    env = create_env(layout_set, obs_type)
+def evaluate_policy(policy, layout_set, normalize_obs=True):
+    """Evaluate a deterministic policy once on every validation layout.
+
+    Each layout gets one sampled feasible start and one sampled feasible
+    goal, so evaluation follows the same randomized regime as training.
+    Layouts are seeded by index, which makes the runs reproducible.
+    """
+    env = create_env(layout_set, normalize_obs=normalize_obs)
     total_reward = 0.0
     total_steps = 0
     successes = 0
     collisions = 0
 
     for layout_index in range(len(env.val_layouts)):
-        state, _ = env.reset(layout_type="val", layout_index=layout_index)
+        env.reset(layout_type="val", layout_index=layout_index, seed=layout_index)
+        start = env.sample_random_state(margin=0.3, max_speed=1.0)
+        goal = env.sample_random_state(margin=0.3, max_speed=0.0)
+        while np.hypot(start[0] - goal[0], start[1] - goal[1]) <= 2 * env.goal_radius:
+            goal = env.sample_random_state(margin=0.3, max_speed=0.0)
+        state, _ = env.reset(layout_type="fixed", state=start, goal=goal)
+
         episode_reward = 0.0
         episode_steps = 0
 
@@ -52,34 +63,16 @@ def evaluate_policy(policy, layout_set, obs_type):
     }
 
 
-def reset_for_episode(
-    env,
-    reset_mode,
-    random_reset_frac,
-    random_reset_margin,
-    random_reset_max_speed,
-    random_phase,
-):
-    """Reset for a new episode; returns (observation, used_random_state).
-
-    During the random-exploration phase every episode starts from a random
-    safe state. In the learning phase, ``fixed`` keeps the standard start
-    and ``mixed`` additionally starts from a random state with probability
-    ``random_reset_frac``.
-    """
-    use_random = random_phase or (
-        reset_mode == "mixed"
-        and env.np_random.uniform() < random_reset_frac
+def episode_reset(env, random_reset_margin, random_reset_max_speed):
+    """Reset for a new episode: sample a layout, a random feasible start,
+    and a random feasible goal separated from the start."""
+    start = env.sample_random_state(
+        margin=random_reset_margin, max_speed=random_reset_max_speed
     )
-
-    if use_random:
-        state = env.sample_random_state(
-            margin=random_reset_margin, max_speed=random_reset_max_speed
-        )
-        observation, _ = env.reset(layout_type="train", state=state)
-    else:
-        observation, _ = env.reset(layout_type="train")
-    return observation, use_random
+    goal = env.sample_random_state(margin=random_reset_margin, max_speed=0.0)
+    while np.hypot(start[0] - goal[0], start[1] - goal[1]) <= 2 * env.goal_radius:
+        goal = env.sample_random_state(margin=random_reset_margin, max_speed=0.0)
+    return env.reset(layout_type="train", state=start, goal=goal)
 
 
 def set_seed(seed):
@@ -93,7 +86,7 @@ def set_seed(seed):
 def main(args):
     set_seed(args.seed)
 
-    env = create_env(args.layout_set, args.obs)
+    env = create_env(args.layout_set, normalize_obs=args.normalize_obs)
     env.action_space.seed(args.seed)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -125,7 +118,6 @@ def main(args):
     config = vars(args) | {
         "agent": "td3",
         "layout_set": args.layout_set,
-        "obs_type": args.obs,
         "state_dim": state_dim,
         "action_dim": action_dim,
         "max_action": max_action,
@@ -135,6 +127,7 @@ def main(args):
         "corridor_width": 5.0,
         "lidar_range": 5.0,
         "num_lidar_rays": 64,
+        "goal_radius": env.goal_radius,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
@@ -143,35 +136,25 @@ def main(args):
     print(f"Action dimension: {action_dim}")
     print(f"Saving checkpoints to: {model_path}")
 
-    # The first reset seeds the environment RNG; the episode start state is
-    # chosen by reset_for_episode (random during the exploration phase).
+    # The first reset seeds the environment RNG; episode_reset then picks
+    # the layout and the random start and goal states.
     env.reset(layout_type="train", seed=args.seed)
-    state, _ = reset_for_episode(
-        env,
-        args.reset_mode,
-        args.random_reset_frac,
-        args.random_reset_margin,
-        args.random_reset_max_speed,
-        random_phase=True,
+    state, _ = episode_reset(
+        env, args.random_reset_margin, args.random_reset_max_speed
     )
-    warmup_announced = args.start_timesteps <= 0
     episode_reward = 0.0
     episode_steps = 0
     episode_num = 0
 
     for timestep in range(args.max_timesteps):
         episode_steps += 1
-        random_phase = timestep < args.start_timesteps
-        if random_phase:
-            action = env.action_space.sample()
-        else:
-            action = policy.select_action(state)
-            noise = np.random.normal(
-                loc=0.0,
-                scale=max_action * args.expl_noise,
-                size=action_dim,
-            )
-            action = np.clip(action + noise, -max_action, max_action)
+        action = policy.select_action(state)
+        noise = np.random.normal(
+            loc=0.0,
+            scale=max_action * args.expl_noise,
+            size=action_dim,
+        )
+        action = np.clip(action + noise, -max_action, max_action)
 
         next_state, reward, terminated, truncated, info = env.step(action)
         episode_reward += reward
@@ -180,17 +163,8 @@ def main(args):
         replay_buffer.add(state, action, next_state, reward, float(terminated))
         state = next_state
 
-        if not random_phase and replay_buffer.size >= args.batch_size:
-            # During the random-exploration phase TD3 only collects transitions;
-            # training starts at --start-timesteps.
+        if replay_buffer.size >= args.batch_size:
             policy.train(replay_buffer, batch_size=args.batch_size)
-
-        if not random_phase and not warmup_announced:
-            warmup_announced = True
-            print(
-                f"Random exploration complete at step {timestep + 1}; "
-                f"TD3 training started"
-            )
 
         if terminated or truncated:
             print(
@@ -198,17 +172,9 @@ def main(args):
                 f"length {episode_steps:4d} | reward {episode_reward:8.3f} | "
                 f"collision {info['collision']} | goal {info['goal_reached']}"
             )
-            state, used_random = reset_for_episode(
-                env,
-                args.reset_mode,
-                args.random_reset_frac,
-                args.random_reset_margin,
-                args.random_reset_max_speed,
-                random_phase=(timestep + 1) < args.start_timesteps,
+            state, _ = episode_reset(
+                env, args.random_reset_margin, args.random_reset_max_speed
             )
-            if used_random:
-                x, _, y, _ = env.dynamics.get_state()
-                print(f"  -> random start at ({x:.2f}, {y:.2f})")
             episode_reward = 0.0
             episode_steps = 0
             episode_num += 1
@@ -217,7 +183,9 @@ def main(args):
             print(f"Step {timestep + 1}: replay_size={replay_buffer.size}")
 
         if args.eval_freq > 0 and (timestep + 1) % args.eval_freq == 0:
-            results = evaluate_policy(policy, args.layout_set, args.obs)
+            results = evaluate_policy(
+                policy, args.layout_set, args.normalize_obs
+            )
             print(
                 f"Evaluation at {timestep + 1}: "
                 f"mean_reward={results['mean_reward']:.3f}, "
@@ -241,16 +209,22 @@ def parse_args():
         help="Layout set name; loads layouts/<name>_{train,test,validation}.npy",
     )
     parser.add_argument(
-        "--obs",
-        choices=("lidar", "state"),
-        default="lidar",
-        help="Observation variant: 'lidar' = velocity + 64 lidar rays; "
-             "'state' = [x, x_dot, y, y_dot] + all pillar positions "
-             "(ablation with perfect obstacle knowledge, no sensing)",
+        "--normalize-obs",
+        dest="normalize_obs",
+        action="store_true",
+        default=True,
+        help="Scale observation components by their known ranges (default); "
+             "checkpoints trained with --no-normalize-obs must be evaluated "
+             "with --no-normalize-obs",
+    )
+    parser.add_argument(
+        "--no-normalize-obs",
+        dest="normalize_obs",
+        action="store_false",
+        help="Disable observation scaling",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-timesteps", type=int, default=30_000)
-    parser.add_argument("--start-timesteps", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--replay-size", type=int, default=1_000_000)
     parser.add_argument("--expl-noise", type=float, default=0.1)
@@ -259,22 +233,11 @@ def parse_args():
     parser.add_argument("--policy-noise", type=float, default=0.2)
     parser.add_argument("--noise-clip", type=float, default=0.5)
     parser.add_argument("--policy-freq", type=int, default=2)
-    parser.add_argument(
-        "--reset-mode",
-        choices=["fixed", "mixed"],
-        default="fixed",
-        help="Learning-phase episode start: 'fixed' keeps the standard start; "
-             "'mixed' additionally starts each episode from a random safe "
-             "state with probability --random-reset-frac. The random-"
-             "exploration phase always uses random starts for coverage",
-    )
-    parser.add_argument("--random-reset-frac", type=float, default=0.15,
-                        help="Probability of a random start in 'mixed' mode")
     parser.add_argument("--random-reset-margin", type=float, default=0.3,
                         help="Extra clearance (m) beyond the collision "
-                             "boundary for random start states")
+                             "boundary for sampled start and goal states")
     parser.add_argument("--random-reset-max-speed", type=float, default=1.0,
-                        help="Maximum speed (m/s) of the random initial velocity")
+                        help="Maximum speed (m/s) of the sampled start velocity")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
     parser.add_argument("--log-freq", type=int, default=1_000,
@@ -283,14 +246,10 @@ def parse_args():
 
     if args.max_timesteps < 1:
         parser.error("--max-timesteps must be positive")
-    if not 0 <= args.start_timesteps <= args.max_timesteps:
-        parser.error("--start-timesteps must be between 0 and --max-timesteps")
     if args.batch_size < 1 or args.replay_size < args.batch_size:
         parser.error("--replay-size must be at least --batch-size, both positive")
     if args.policy_freq < 1:
         parser.error("--policy-freq must be positive")
-    if not 0 <= args.random_reset_frac <= 1:
-        parser.error("--random-reset-frac must be in [0, 1]")
     if args.random_reset_margin < 0:
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:

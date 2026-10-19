@@ -12,7 +12,7 @@
 # Examples:
 #   ./train.sh rcrl --name rcrl_lidar
 #   ./train.sh rcrl-vec --name rcrl_vec --num-envs 32
-#   ./train.sh td3 --name td3_state --obs state
+#   ./train.sh td3 --name td3_run
 #   ./train.sh rcrl --name quick --max-timesteps 8 --eval-freq 0
 set -euo pipefail
 

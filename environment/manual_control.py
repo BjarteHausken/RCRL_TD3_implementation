@@ -70,6 +70,10 @@ def draw_environment():
         pillar = Circle((pillar_x, pillar_y), pillar_radius, color="gray")
         ax.add_patch(pillar)
 
+    # Goal
+    goal = Circle((env.goal[0], env.goal[1]), env.goal_radius, color="green")
+    ax.add_patch(goal)
+
     # LiDAR
     lidar = env.get_lidar()
     
@@ -130,6 +134,9 @@ fig.canvas.mpl_connect("key_release_event", on_key_release)
 
 plt.ion()
 plt.show(block=False)
+
+# Sample an initial start and goal before the first step.
+env.reset()
 
 while plt.fignum_exists(fig.number):
     action = get_action()

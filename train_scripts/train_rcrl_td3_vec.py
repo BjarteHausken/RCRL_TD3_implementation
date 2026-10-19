@@ -33,8 +33,8 @@ import torch
 from agents.rcrl_td3 import RCRLTD3, device
 from environment import create_env
 from train_scripts.train_rcrl_td3 import (
+    episode_reset,
     evaluate_policy,
-    reset_for_episode,
     set_seed,
 )
 from utils import ReplayBufferRCRLTD3Torch
@@ -43,7 +43,10 @@ from utils import ReplayBufferRCRLTD3Torch
 def main(args):
     set_seed(args.seed)
 
-    envs = [create_env(args.layout_set, args.obs) for _ in range(args.num_envs)]
+    envs = [
+        create_env(args.layout_set, normalize_obs=args.normalize_obs)
+        for _ in range(args.num_envs)
+    ]
     state_dim = envs[0].observation_space.shape[0]
     action_dim = envs[0].action_space.shape[0]
     max_action = float(envs[0].action_space.high[0])
@@ -60,10 +63,12 @@ def main(args):
         critic_lr=args.critic_lr,
         actor_lr=args.actor_lr,
         safety_lr=args.safety_lr,
+        grad_clip=args.grad_clip,
         multiplier_lr=args.multiplier_lr,
         multiplier_freq=args.multiplier_freq,
         max_lambda=args.max_lambda,
         initial_lambda=args.initial_lambda,
+        multiplier_type=args.multiplier,
     )
     if args.random_reset_max_speed > envs[0].dynamics.max_velocity:
         raise ValueError(
@@ -83,7 +88,6 @@ def main(args):
         "agent": "rcrl_td3",
         "trainer": "vectorized",
         "layout_set": args.layout_set,
-        "obs_type": args.obs,
         "state_dim": state_dim,
         "action_dim": action_dim,
         "max_action": max_action,
@@ -94,6 +98,7 @@ def main(args):
         "corridor_width": 5.0,
         "lidar_range": 5.0,
         "num_lidar_rays": 64,
+        "goal_radius": envs[0].goal_radius,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
@@ -109,16 +114,11 @@ def main(args):
     observations = np.empty((args.num_envs, state_dim), dtype=np.float32)
     for i, env in enumerate(envs):
         env.action_space.seed(args.seed + i)
-        # The first reset seeds the environment RNG; the episode start state
-        # is chosen by reset_for_episode (random during the exploration phase).
+        # The first reset seeds the environment RNG; episode_reset then
+        # picks the layout and the random start and goal states.
         env.reset(layout_type="train", seed=args.seed + i)
-        observation, _ = reset_for_episode(
-            env,
-            args.reset_mode,
-            args.random_reset_frac,
-            args.random_reset_margin,
-            args.random_reset_max_speed,
-            random_phase=True,
+        observation, _ = episode_reset(
+            env, args.random_reset_margin, args.random_reset_max_speed
         )
         observations[i] = observation
 
@@ -139,7 +139,6 @@ def main(args):
     window_collisions = 0
     window_goals = 0
 
-    warmup_announced = args.start_timesteps <= 0
     env_steps_done = 0
     next_log = args.log_freq if args.log_freq > 0 else None
     next_eval = args.eval_freq if args.eval_freq > 0 else None
@@ -147,24 +146,18 @@ def main(args):
 
     meta_steps = -(-args.max_timesteps // args.num_envs)  # ceil division
     for _ in range(meta_steps):
-        random_phase = env_steps_done < args.start_timesteps
-
-        if random_phase:
-            for i, env in enumerate(envs):
-                actions[i] = env.action_space.sample()
-        else:
-            # One actor forward pass for all environments.
-            obs_tensor = torch.as_tensor(
-                observations, dtype=torch.float32, device=device
-            )
-            with torch.no_grad():
-                policy_actions = policy.actor(obs_tensor).cpu().numpy()
-            noise = np.random.normal(
-                loc=0.0,
-                scale=max_action * args.expl_noise,
-                size=(args.num_envs, action_dim),
-            )
-            actions[:] = np.clip(policy_actions + noise, -max_action, max_action)
+        # One actor forward pass for all environments.
+        obs_tensor = torch.as_tensor(
+            observations, dtype=torch.float32, device=device
+        )
+        with torch.no_grad():
+            policy_actions = policy.actor(obs_tensor).cpu().numpy()
+        noise = np.random.normal(
+            loc=0.0,
+            scale=max_action * args.expl_noise,
+            size=(args.num_envs, action_dim),
+        )
+        actions[:] = np.clip(policy_actions + noise, -max_action, max_action)
 
         for i, env in enumerate(envs):
             next_state, reward, terminated, truncated, info = env.step(actions[i])
@@ -186,16 +179,8 @@ def main(args):
                 window_lengths.append(episode_steps[i])
                 window_collisions += int(info["collision"])
                 window_goals += int(info["goal_reached"])
-                observation, _ = reset_for_episode(
-                    env,
-                    args.reset_mode,
-                    args.random_reset_frac,
-                    args.random_reset_margin,
-                    args.random_reset_max_speed,
-                    # This environment just completed global step
-                    # env_steps_done + 1; mirror the sequential trainer's
-                    # (timestep + 1) < start_timesteps boundary.
-                    random_phase=(env_steps_done + 1) < args.start_timesteps,
+                observation, _ = episode_reset(
+                    env, args.random_reset_margin, args.random_reset_max_speed
                 )
                 observations[i] = observation
                 episode_reward[i] = 0.0
@@ -215,33 +200,16 @@ def main(args):
         env_steps_done += args.num_envs
 
         # One update per collected transition, back-to-back so the GPU can
-        # overlap kernel execution with launch overhead. The boundary meta
-        # step may run a few warmup updates on post-boundary transitions
-        # (or vice versa) when start_timesteps is not a multiple of
-        # --num-envs.
+        # overlap kernel execution with launch overhead.
         if replay_buffer.size >= args.batch_size:
-            if random_phase:
-                for _ in range(args.num_envs):
-                    policy.train_warmup(replay_buffer, batch_size=args.batch_size)
-            else:
-                for _ in range(args.num_envs):
-                    policy.train(replay_buffer, batch_size=args.batch_size)
-
-        if not random_phase and not warmup_announced:
-            warmup_announced = True
-            print(
-                f"Random exploration complete at step {env_steps_done}; "
-                f"full RCRL training started"
-            )
+            for _ in range(args.num_envs):
+                policy.train(replay_buffer, batch_size=args.batch_size)
 
         if next_log is not None and env_steps_done >= next_log:
             next_log += args.log_freq
             elapsed = time.perf_counter() - start_time
             with torch.no_grad():
-                obs_tensor = torch.as_tensor(
-                    observations, dtype=torch.float32, device=device
-                )
-                mean_lambda = policy.multiplier(obs_tensor).mean().item()
+                mean_lambda = policy.mean_lambda(observations)
             message = (
                 f"Step {env_steps_done}: replay_size={replay_buffer.size}, "
                 f"mean_lambda={mean_lambda:.4f}, "
@@ -263,7 +231,9 @@ def main(args):
 
         if next_eval is not None and env_steps_done >= next_eval:
             next_eval += args.eval_freq
-            results = evaluate_policy(policy, args.layout_set, args.obs)
+            results = evaluate_policy(
+                policy, args.layout_set, args.normalize_obs
+            )
             print(
                 f"Evaluation at {env_steps_done}: "
                 f"mean_reward={results['mean_reward']:.3f}, "
@@ -294,16 +264,22 @@ def parse_args():
         help="Layout set name; loads layouts/<name>_{train,test,validation}.npy",
     )
     parser.add_argument(
-        "--obs",
-        choices=("lidar", "state"),
-        default="lidar",
-        help="Observation variant: 'lidar' = velocity + 64 lidar rays; "
-             "'state' = [x, x_dot, y, y_dot] + all pillar positions "
-             "(ablation with perfect obstacle knowledge, no sensing)",
+        "--normalize-obs",
+        dest="normalize_obs",
+        action="store_true",
+        default=True,
+        help="Scale observation components by their known ranges (default); "
+             "checkpoints trained with --no-normalize-obs must be evaluated "
+             "with --no-normalize-obs",
+    )
+    parser.add_argument(
+        "--no-normalize-obs",
+        dest="normalize_obs",
+        action="store_false",
+        help="Disable observation scaling",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-timesteps", type=int, default=30_000)
-    parser.add_argument("--start-timesteps", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--replay-size", type=int, default=1_000_000)
     parser.add_argument("--expl-noise", type=float, default=0.1)
@@ -315,26 +291,25 @@ def parse_args():
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--actor-lr", type=float, default=2e-5)
     parser.add_argument("--safety-lr", type=float, default=1e-4)
+    parser.add_argument("--grad-clip", type=float, default=1.0,
+                        help="Max global gradient norm for all networks; 0 disables clipping")
     parser.add_argument("--multiplier-lr", type=float, default=1e-6)
     parser.add_argument("--multiplier-freq", type=int, default=6)
+    parser.add_argument(
+        "--multiplier",
+        choices=["network", "scalar"],
+        default="scalar",
+        help="'network' uses a statewise lambda(s) network; 'scalar' uses a "
+             "single fixed Lagrange multiplier for all states, set by "
+             "--initial-lambda and not updated during training",
+    )
     parser.add_argument("--max-lambda", type=float, default=100.0)
     parser.add_argument("--initial-lambda", type=float, default=0.1)
-    parser.add_argument(
-        "--reset-mode",
-        choices=["fixed", "mixed"],
-        default="fixed",
-        help="Learning-phase episode start: 'fixed' keeps the standard start; "
-             "'mixed' additionally starts each episode from a random safe "
-             "state with probability --random-reset-frac. The random-"
-             "exploration phase always uses random starts for coverage",
-    )
-    parser.add_argument("--random-reset-frac", type=float, default=0.15,
-                        help="Probability of a random start in 'mixed' mode")
     parser.add_argument("--random-reset-margin", type=float, default=0.3,
                         help="Extra clearance (m) beyond the collision "
-                             "boundary for random start states")
+                             "boundary for sampled start and goal states")
     parser.add_argument("--random-reset-max-speed", type=float, default=1.0,
-                        help="Maximum speed (m/s) of the random initial velocity")
+                        help="Maximum speed (m/s) of the sampled start velocity")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
     parser.add_argument("--log-freq", type=int, default=1_000,
@@ -345,8 +320,6 @@ def parse_args():
         parser.error("--max-timesteps must be positive")
     if args.num_envs < 1:
         parser.error("--num-envs must be positive")
-    if not 0 <= args.start_timesteps <= args.max_timesteps:
-        parser.error("--start-timesteps must be between 0 and --max-timesteps")
     if args.batch_size < 1 or args.replay_size < args.batch_size:
         parser.error("--replay-size must be at least --batch-size, both positive")
     if args.policy_freq < 1:
@@ -355,8 +328,6 @@ def parse_args():
         parser.error("--multiplier-freq must be at least --policy-freq")
     if args.max_lambda <= 0 or not 0 < args.initial_lambda <= args.max_lambda:
         parser.error("--initial-lambda must be in (0, --max-lambda]")
-    if not 0 <= args.random_reset_frac <= 1:
-        parser.error("--random-reset-frac must be in [0, 1]")
     if args.random_reset_margin < 0:
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:

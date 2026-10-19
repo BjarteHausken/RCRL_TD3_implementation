@@ -4,7 +4,6 @@ from environment.environment import CorridorEnvironment
 
 def create_env(
     layout_set="one",
-    obs_type="lidar",
     dt=0.1,
     max_velocity=3.0,
     length=30.0,
@@ -14,7 +13,9 @@ def create_env(
     num_lidar_rays=64,
     max_acceleration=2.0,
     pillars_positions=None,
+    goal_radius=0.5,
     max_steps=1000,
+    normalize_obs=True,
 ):
     """Corridor environment with the standard training/evaluation parameters.
 
@@ -33,6 +34,7 @@ def create_env(
         max_acceleration=max_acceleration,
         pillars_positions=pillars_positions,
         layout_set=layout_set,
-        obs_type=obs_type,
+        goal_radius=goal_radius,
         max_steps=max_steps,
+        normalize_obs=normalize_obs,
     )

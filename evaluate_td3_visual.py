@@ -1,29 +1,38 @@
+import argparse
+import json
 import time
 import os
-import argparse
+
+import numpy as np
 
 import matplotlib
 from PIL import Image
 
 from agents.td3 import TD3
-from agents.rcrl_td3 import RCRL_TD3
+from agents.rcrl_td3 import RCRLTD3
 from environment import create_env
 
 
-def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one", obs_type="lidar",
-         save_gif=None, gif_max_width=900):
+def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one",
+         normalize_obs=True, save_gif=None, gif_max_width=900):
     if save_gif is not None:
         # Headless capture: no interactive window, frames come from the canvas buffer.
         matplotlib.use("Agg")
 
-    env = create_env(layout_set, obs_type)
+    env = create_env(layout_set, normalize_obs=normalize_obs)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
 
-    agent_class = {"td3": TD3, "rcrl_td3": RCRL_TD3}[agent_type]
-    policy = agent_class(state_dim, action_dim, max_action)
+    if agent_type == "td3":
+        policy = TD3(state_dim, action_dim, max_action)
+    else:
+        # The multiplier type is a property of the checkpoint, not of the
+        # evaluation: reconstruct the agent the run was trained with.
+        with open(os.path.join(os.path.dirname(MODEL_PATH), "config.json")) as f:
+            multiplier_type = json.load(f)["multiplier"]
+        policy = RCRLTD3(state_dim, action_dim, max_action, multiplier_type=multiplier_type)
     policy.load(MODEL_PATH)
     print("Loaded model:", MODEL_PATH)
 
@@ -36,7 +45,14 @@ def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one", o
                 f"Test layout index must be between 0 and {len(env.test_layouts) - 1}"
             )
 
-    state, info = env.reset(layout_type="test", layout_index=layout_idx)
+    # Same randomized regime as training: one sampled feasible start and
+    # one sampled feasible goal, seeded by layout index for reproducibility.
+    env.reset(layout_type="test", layout_index=layout_idx, seed=layout_idx)
+    start = env.sample_random_state(margin=0.3, max_speed=1.0)
+    goal = env.sample_random_state(margin=0.3, max_speed=0.0)
+    while np.hypot(start[0] - goal[0], start[1] - goal[1]) <= 2 * env.goal_radius:
+        goal = env.sample_random_state(margin=0.3, max_speed=0.0)
+    state, info = env.reset(layout_type="fixed", state=start, goal=goal)
     print(f"Test layout: {layout_idx}" + (" (random)" if test_layout == "random" else ""))
     
     episode_reward = 0
@@ -120,10 +136,19 @@ if __name__ == "__main__":
         help="Layout set name; loads layouts/<name>_{train,test,validation}.npy",
     )
     parser.add_argument(
-        "--obs",
-        choices=("lidar", "state"),
-        default="lidar",
-        help="Observation variant the checkpoint was trained with",
+        "--normalize-obs",
+        dest="normalize_obs",
+        action="store_true",
+        default=True,
+        help="Scale observation components by their known ranges (default); "
+             "checkpoints trained with --no-normalize-obs must be evaluated "
+             "with --no-normalize-obs",
+    )
+    parser.add_argument(
+        "--no-normalize-obs",
+        dest="normalize_obs",
+        action="store_false",
+        help="Disable observation scaling",
     )
     parser.add_argument(
         "--save-gif",
@@ -150,6 +175,6 @@ if __name__ == "__main__":
     MODEL_PATH = os.path.join("models", args.name, args.agent)
 
     main(
-        MODEL_PATH, args.agent, args.test_layout, args.layout_set, args.obs,
-        args.save_gif, args.gif_max_width,
+        MODEL_PATH, args.agent, args.test_layout, args.layout_set,
+        args.normalize_obs, args.save_gif, args.gif_max_width,
     )

@@ -233,10 +233,42 @@ def test_random_state_sampling(env):
 
     print("PASS: reset with a custom state")
 
+def test_goal(env):
+    goal = np.array([10.0, 0.0])
+    state = np.array([5.0, 0.0, 0.0, 0.0])
+
+    # The goal passed to reset is stored, and the relative goal coordinates
+    # appear in the observation as (goal - position), scaled when normalizing.
+    obs, _ = env.reset(layout_type="fixed", state=state, goal=goal)
+    np.testing.assert_allclose(env.goal, goal, atol=1e-6)
+    relative = np.array([goal[0] - 5.0, goal[1] - 0.0])
+    if env.normalize_obs:
+        relative = relative / np.array([env.length, env.width])
+    np.testing.assert_allclose(obs[-2:], relative, atol=1e-6)
+
+    # Reward must be higher when moving toward the goal than when moving away.
+    _, _ = env.reset(layout_type="fixed", state=state, goal=goal)
+    _, toward_reward, *_ = env.step([1.0, 0.0])
+    env.reset(layout_type="fixed", state=state, goal=goal)
+    _, away_reward, *_ = env.step([-1.0, 0.0])
+    assert toward_reward > away_reward, (toward_reward, away_reward)
+    print(f"PASS: reward favors moving toward the goal ({toward_reward:.3f} > {away_reward:.3f})")
+
+    # Within goal_radius of the goal, stepping must terminate with the bonus.
+    near_state = np.array([10.0 - 0.3 * env.goal_radius, 0.0, 0.0, 0.0])
+    env.reset(layout_type="fixed", state=near_state, goal=goal)
+    _, reward, terminated, truncated, info = env.step([0.0, 0.0])
+    assert info["goal_reached"], info
+    assert terminated and not truncated
+    assert reward >= 50.0 - 0.1 - 1e-6, reward
+    print(f"PASS: goal reached terminates with bonus (reward={reward:.3f})")
+
+
 #test_collisions(env)
 #test_render(env)
 #test_lidar(env)
 test_gymnasium_env(env)
 test_random_state_sampling(env)
+test_goal(env)
 #test_velocity_limit(dynamics)
 #test_reward_and_constraints(env)
