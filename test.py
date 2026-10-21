@@ -66,7 +66,7 @@ def test_collisions(env):
 
 
 def test_render(env):
-    env.reset([5.0, 2.0, 0.0, 0.5])
+    env.reset(state=[5.0, 2.0, 0.0, 0.5])
     env.render()
     env.step([10.0, 0.0])
     env.render()
@@ -112,7 +112,7 @@ def test_lidar(env):
     print("Hit wall, ", distance)
     
     # Test many lidar rays
-    env.reset([5.0, 0.0, 0.0, 0.0])
+    env.reset(state=[5.0, 0.0, 0.0, 0.0])
     lidar = env.get_lidar()
     print(lidar)
     print(lidar.shape)

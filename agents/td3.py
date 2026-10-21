@@ -73,18 +73,23 @@ class TD3(object):
 		max_action,
 		discount=0.99,
 		tau=0.005,
-		policy_noise=0.2,
+		policy_noise=0.1,
 		noise_clip=0.5,
-		policy_freq=2
+		policy_freq=2,
+		critic_lr=1e-4,
+		actor_lr=2e-5,
+		grad_clip=1.0
 	):
+		if grad_clip < 0:
+			raise ValueError("grad_clip must be nonnegative")
 
 		self.actor = Actor(state_dim, action_dim, max_action).to(device)
 		self.actor_target = copy.deepcopy(self.actor)
-		self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
+		self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
 
 		self.critic = Critic(state_dim, action_dim).to(device)
 		self.critic_target = copy.deepcopy(self.critic)
-		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
+		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
 
 		self.max_action = max_action
 		self.discount = discount
@@ -92,6 +97,7 @@ class TD3(object):
 		self.policy_noise = policy_noise
 		self.noise_clip = noise_clip
 		self.policy_freq = policy_freq
+		self.grad_clip = grad_clip
 
 		self.total_it = 0
 
@@ -131,6 +137,8 @@ class TD3(object):
 		# Optimize the critic
 		self.critic_optimizer.zero_grad()
 		critic_loss.backward()
+		if self.grad_clip > 0:
+			torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
 		self.critic_optimizer.step()
 		# Delayed policy updates
 		if self.total_it % self.policy_freq == 0:
@@ -138,9 +146,11 @@ class TD3(object):
 			# Compute actor losse
 			actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
 			
-			# Optimize the actor 
+			# Optimize the actor
 			self.actor_optimizer.zero_grad()
 			actor_loss.backward()
+			if self.grad_clip > 0:
+				torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip)
 			self.actor_optimizer.step()
 
 			# Update the frozen target models

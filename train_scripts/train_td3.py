@@ -14,65 +14,27 @@ import torch
 
 from agents.td3 import TD3
 from environment import create_env
+from evaluation import evaluate_policy
 from utils import ReplayBuffer
 
 
-def evaluate_policy(policy, layout_set, normalize_obs=True):
-    """Evaluate a deterministic policy once on every validation layout.
+def episode_reset(env, random_reset_margin, random_reset_max_speed, seed=None):
+    """Reset into a new randomized training episode in one call.
 
-    Each layout gets one sampled feasible start and one sampled feasible
-    goal, so evaluation follows the same randomized regime as training.
-    Layouts are seeded by index, which makes the runs reproducible.
+    ``reset`` selects the layout first and then samples a feasible start and
+    goal on that layout, so both always satisfy the clearance margins for the
+    layout the episode actually runs on. The goal is resampled until it is at
+    least two goal radii from the start.
     """
-    env = create_env(layout_set, normalize_obs=normalize_obs)
-    total_reward = 0.0
-    total_steps = 0
-    successes = 0
-    collisions = 0
-
-    for layout_index in range(len(env.val_layouts)):
-        env.reset(layout_type="val", layout_index=layout_index, seed=layout_index)
-        start = env.sample_random_state(margin=0.3, max_speed=1.0)
-        goal = env.sample_random_state(margin=0.3, max_speed=0.0)
-        while np.hypot(start[0] - goal[0], start[1] - goal[1]) <= 2 * env.goal_radius:
-            goal = env.sample_random_state(margin=0.3, max_speed=0.0)
-        state, _ = env.reset(layout_type="fixed", state=start, goal=goal)
-
-        episode_reward = 0.0
-        episode_steps = 0
-
-        while True:
-            action = policy.select_action(state)
-            state, reward, terminated, truncated, info = env.step(action)
-            episode_reward += reward
-            episode_steps += 1
-            if terminated or truncated:
-                break
-
-        total_reward += episode_reward
-        total_steps += episode_steps
-        successes += int(info["goal_reached"])
-        collisions += int(info["collision"])
-
-    num_layouts = len(env.val_layouts)
-    return {
-        "mean_reward": total_reward / num_layouts,
-        "mean_steps": total_steps / num_layouts,
-        "success_rate": successes / num_layouts,
-        "collision_rate": collisions / num_layouts,
-    }
-
-
-def episode_reset(env, random_reset_margin, random_reset_max_speed):
-    """Reset for a new episode: sample a layout, a random feasible start,
-    and a random feasible goal separated from the start."""
-    start = env.sample_random_state(
-        margin=random_reset_margin, max_speed=random_reset_max_speed
+    return env.reset(
+        layout_type="train",
+        seed=seed,
+        sample_start=True,
+        start_margin=random_reset_margin,
+        start_max_speed=random_reset_max_speed,
+        goal_margin=random_reset_margin,
+        min_start_goal_distance=2 * env.goal_radius,
     )
-    goal = env.sample_random_state(margin=random_reset_margin, max_speed=0.0)
-    while np.hypot(start[0] - goal[0], start[1] - goal[1]) <= 2 * env.goal_radius:
-        goal = env.sample_random_state(margin=random_reset_margin, max_speed=0.0)
-    return env.reset(layout_type="train", state=start, goal=goal)
 
 
 def set_seed(seed):
@@ -101,6 +63,9 @@ def main(args):
         policy_noise=args.policy_noise,
         noise_clip=args.noise_clip,
         policy_freq=args.policy_freq,
+        critic_lr=args.critic_lr,
+        actor_lr=args.actor_lr,
+        grad_clip=args.grad_clip,
     )
     if args.random_reset_max_speed > env.dynamics.max_velocity:
         raise ValueError(
@@ -121,13 +86,16 @@ def main(args):
         "state_dim": state_dim,
         "action_dim": action_dim,
         "max_action": max_action,
-        "dt": 0.1,
-        "max_velocity": 3.0,
-        "corridor_length": 30.0,
-        "corridor_width": 5.0,
-        "lidar_range": 5.0,
-        "num_lidar_rays": 64,
+        "dt": env.dynamics.dt,
+        "max_velocity": env.dynamics.max_velocity,
+        "corridor_length": env.length,
+        "corridor_width": env.width,
+        "vehicle_radius": env.vehicle_radius,
+        "lidar_range": env.lidar_range,
+        "num_lidar_rays": env.num_lidar_rays,
+        "max_acceleration": env.max_acceleration,
         "goal_radius": env.goal_radius,
+        "max_steps": env.max_steps,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
@@ -136,11 +104,9 @@ def main(args):
     print(f"Action dimension: {action_dim}")
     print(f"Saving checkpoints to: {model_path}")
 
-    # The first reset seeds the environment RNG; episode_reset then picks
-    # the layout and the random start and goal states.
-    env.reset(layout_type="train", seed=args.seed)
+    # The first episode reset also seeds the environment RNG.
     state, _ = episode_reset(
-        env, args.random_reset_margin, args.random_reset_max_speed
+        env, args.random_reset_margin, args.random_reset_max_speed, seed=args.seed
     )
     episode_reward = 0.0
     episode_steps = 0
@@ -184,13 +150,20 @@ def main(args):
 
         if args.eval_freq > 0 and (timestep + 1) % args.eval_freq == 0:
             results = evaluate_policy(
-                policy, args.layout_set, args.normalize_obs
+                policy,
+                args.layout_set,
+                args.normalize_obs,
+                episodes_per_layout=args.eval_episodes_per_layout,
+                random_reset_margin=args.random_reset_margin,
+                random_reset_max_speed=args.random_reset_max_speed,
             )
             print(
                 f"Evaluation at {timestep + 1}: "
                 f"mean_reward={results['mean_reward']:.3f}, "
                 f"mean_steps={results['mean_steps']:.1f}, "
-                f"success_rate={results['success_rate']:.1%}, "
+                f"success_rate={results['success_rate']:.1%} "
+                f"(95% CI {results['success_rate_ci'][0]:.1%}-"
+                f"{results['success_rate_ci'][1]:.1%}), "
                 f"collision_rate={results['collision_rate']:.1%}"
             )
             policy.save(model_path)
@@ -230,9 +203,13 @@ def parse_args():
     parser.add_argument("--expl-noise", type=float, default=0.1)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--policy-noise", type=float, default=0.2)
+    parser.add_argument("--policy-noise", type=float, default=0.1)
     parser.add_argument("--noise-clip", type=float, default=0.5)
     parser.add_argument("--policy-freq", type=int, default=2)
+    parser.add_argument("--critic-lr", type=float, default=1e-4)
+    parser.add_argument("--actor-lr", type=float, default=2e-5)
+    parser.add_argument("--grad-clip", type=float, default=1.0,
+                        help="Max global gradient norm for all networks; 0 disables clipping")
     parser.add_argument("--random-reset-margin", type=float, default=0.3,
                         help="Extra clearance (m) beyond the collision "
                              "boundary for sampled start and goal states")
@@ -240,6 +217,9 @@ def parse_args():
                         help="Maximum speed (m/s) of the sampled start velocity")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
+    parser.add_argument("--eval-episodes-per-layout", type=int, default=20,
+                        help="Episodes with sampled start/goal pairs to run "
+                             "on each validation layout during evaluation")
     parser.add_argument("--log-freq", type=int, default=1_000,
                         help="Set to 0 to disable progress logging")
     args = parser.parse_args()
@@ -254,6 +234,8 @@ def parse_args():
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:
         parser.error("--random-reset-max-speed must be positive")
+    if args.eval_episodes_per_layout < 1:
+        parser.error("--eval-episodes-per-layout must be positive")
     return args
 
 

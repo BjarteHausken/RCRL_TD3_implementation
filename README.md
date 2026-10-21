@@ -11,24 +11,26 @@ The RCRL implementation is an adaptation, not a reproduction, of the paper's exp
 
 ```text
 agents/
-  td3.py                     Plain TD3 (original implementation)
+  td3.py                     Plain TD3 baseline (hyperparameters matched to RCRL-TD3)
   rcrl_td3.py                TD3 + RCRL safety critic, statewise or fixed-scalar multiplier
 environment/
   __init__.py                create_env factory (standard corridor parameters)
   dynamics.py                Exact double-integrator discretization (dt = 0.1 s)
-  environment.py             Gymnasium corridor environment
+  environment.py             Gymnasium corridor environment (+ batched step_batch)
   layouts/generate_layouts.py  Random pillar-layout generator
   manual_control.py          Manual keyboard driving for environment sanity checks
 layouts/                     Layout sets: <set>_{train,test,validation}.npy
 models/                      Training runs (checkpoints + config.json)
 utils.py                     Replay buffers (plain, and RCRL with h/h')
-train.sh                     Wrapper: ./train.sh <rcrl|rcrl-vec|td3> [trainer flags]
+train.sh                     Wrapper: ./train.sh <rcrl|rcrl-vec|td3|td3-vec> [trainer flags]
 train_scripts/
   train_rcrl_td3.py          Trainer for the RCRL agent
   train_rcrl_td3_vec.py      Vectorized RCRL trainer (parallel envs, device buffer)
   train_td3.py               Trainer for the plain TD3 baseline
-evaluate_td3.py              Headless evaluation over all test layouts
-evaluate_td3_visual.py       Rendered single-episode evaluation
+  train_td3_vec.py           Vectorized TD3 trainer (parallel envs, device buffer)
+evaluate.py                  Headless evaluation over all test layouts
+evaluate_visual.py           Rendered single-episode evaluation
+evaluation.py                Batched evaluation used by trainers and evaluate.py
 test.py                      Environment checks (gymnasium check_env, margins)
 ```
 
@@ -54,7 +56,7 @@ A corridor of length 30 m and width 5 m with cylindrical pillars (radius 0.5 m).
 | Observation | velocity (2) + 64 lidar rays of 5.0 m range + goal-relative coordinates (2) → 68-dim |
 | Termination | wall/pillar collision, or goal reached (distance to goal `<= goal_radius = 0.5 m`) |
 | Truncation | 1000-step time limit (bootstrapped; configurable via `max_steps`) |
-| Reward | `5 * (d_old - d_new) - 0.1` per step (`d` = distance to the goal), +50 on reaching the goal |
+| Reward | `2.5 * (d_old - d_new) - 0.1` per step (`d` = distance to the goal), +50 on reaching the goal |
 
 The state constraint is `h(s) = vehicle_radius - min(lidar_distances)`, where `vehicle_radius = 0.2 m`; see [Constraint convention](#constraint-convention).
 
@@ -80,38 +82,43 @@ Run from the repository root as a module:
 python -m train_scripts.train_rcrl_td3 --name my_rcrl_run
 ```
 
-To use a single fixed Lagrange multiplier instead of the statewise `lambda(s)` network, pass `--multiplier scalar` and set its value with `--initial-lambda`:
+The default is `--multiplier scalar`, a single fixed Lagrange multiplier shared by all states and set with `--initial-lambda` (never updated during training). To use the paper's statewise `lambda(s)` network instead, pass `--multiplier network`:
 
 ```bash
-python -m train_scripts.train_rcrl_td3 --name my_rcrl_scalar --multiplier scalar --initial-lambda 0.5
+python -m train_scripts.train_rcrl_td3 --name my_rcrl_network --multiplier network
 ```
 
-The plain TD3 baseline (same randomized start+goal episode regime, but no
-safety critic or multiplier) has its own trainer:
+The plain TD3 baseline (same randomized start+goal episode regime, same
+actor/critic learning rates, and the same gradient clipping, but no safety
+critic or multiplier) has its own trainer:
 
 ```bash
 python -m train_scripts.train_td3 --name my_td3_run
 ```
 
-### Vectorized RCRL training
+### Vectorized training
 
-`train_rcrl_td3_vec.py` runs the same algorithm with the same update-to-data
-ratio, but with `--num-envs` parallel environments (default 32): one batched
-actor forward pass per vectorized step, a device-resident replay buffer, and
-back-to-back per-transition updates. Checkpoints and `config.json` have the
-same format as the sequential trainer, so evaluation is unchanged:
+`train_rcrl_td3_vec.py` and `train_td3_vec.py` run the same algorithms with
+the same update-to-data ratio, but with `--num-envs` parallel environments
+(default 32): one batched actor forward pass per vectorized step, a
+device-resident replay buffer, and one gradient update per collected
+transition, run back-to-back. Checkpoints and `config.json` have the same
+format as the sequential trainers (with `"trainer": "vectorized"` added), so
+evaluation is unchanged:
 
 ```bash
 python -m train_scripts.train_rcrl_td3_vec --name my_rcrl_vec --num-envs 32
+python -m train_scripts.train_td3_vec --name my_td3_vec --num-envs 32
 ```
 
-All three trainers are also available through the wrapper script, which
+All four trainers are also available through the wrapper script, which
 selects the module by agent name and passes the flags through unchanged:
 
 ```bash
 ./train.sh rcrl --name my_rcrl_run
 ./train.sh rcrl-vec --name my_rcrl_vec --num-envs 32
 ./train.sh td3 --name my_td3_run
+./train.sh td3-vec --name my_td3_vec --num-envs 32
 ```
 
 For a small end-to-end check:
@@ -129,15 +136,17 @@ Checkpoints are written under `models/<name>/` with the agent name as prefix (`r
 Evaluate a checkpoint on all test layouts with the matching `--agent`:
 
 ```bash
-python evaluate_td3.py --name my_rcrl_run --agent rcrl_td3
-python evaluate_td3_visual.py --name my_rcrl_run --agent rcrl_td3
+python evaluate.py --name my_rcrl_run --agent rcrl_td3
+python evaluate_visual.py --name my_rcrl_run --agent rcrl_td3
 ```
 
-`evaluate_td3.py` reports per-layout outcomes and the same aggregates as the in-training evaluation: mean reward, mean steps, success rate, and collision rate. Each test layout gets one sampled feasible start and one sampled feasible goal — the same randomized regime as training — seeded by the layout index, so evaluation runs are reproducible.
+`evaluate.py` reports per-layout outcomes and the same aggregates as the in-training evaluation: mean reward, mean steps, success rate, and collision rate. Each test layout is run for `--eval-episodes-per-layout` episodes (default 20), each with a freshly sampled feasible start and goal — the same randomized regime as training. Episodes are seeded by index, so evaluation runs are reproducible, and rates are reported with 95% Wilson confidence intervals.
 
-For `--agent rcrl_td3`, the evaluation scripts read the run's `config.json` to reconstruct the exact agent (in particular `--multiplier`), so a checkpoint loads against the same network structure it was saved with.
+Evaluation is batched: all episodes are stepped in parallel through `environment.step_batch`, with one actor forward pass over the stacked observations per timestep instead of one pass per episode. Finished episodes leave the batch immediately, so the loop stops as soon as every episode is done. The sampled starts, goals, and stopping rules match the sequential evaluation. Because the actor runs in a batch, floating-point accumulation differs slightly from single-row forwards, so individual episode rewards can shift marginally while the episode outcomes and step counts remain the same.
 
-`evaluate_td3_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout.
+For `--agent rcrl_td3`, the evaluation scripts read the run's `config.json` to reconstruct the exact agent (`--multiplier`, `--initial-lambda`, and `--max-lambda`), so a checkpoint loads against the same network structure and multiplier parameterization it was saved with. The evaluation sampling margin and speed bound are also read from the run's `config.json`.
+
+`evaluate_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout.
 
 ## Manual control and tests
 
@@ -206,8 +215,8 @@ The reward critic and safety critic update every gradient step. The actor update
 | `--policy-freq` | `2` | actor/target update interval |
 | `--multiplier-freq` | `6` | multiplier update interval |
 | `--max-lambda` | `100` | upper multiplier bound |
-| `--initial-lambda` | `0.1` | initial multiplier output; the fixed value in `--multiplier scalar` mode |
-| `--multiplier` | `network` | `network` for the statewise `lambda(s)` network, `scalar` for one fixed multiplier |
+| `--initial-lambda` | `10.0` | initial multiplier output; the fixed value in `--multiplier scalar` mode |
+| `--multiplier` | `scalar` | `scalar` for one fixed multiplier, `network` for the statewise `lambda(s)` network |
 
 ### 5. Preserve stable TD3 reward learning
 
@@ -223,11 +232,13 @@ The actor, reward critic, safety critic, and each optimizer are saved in every R
 
 RCRL imposes its constraint on the states in the support of the initial-state distribution (Prop. 4.1 of the paper), and the dual update only learns `lambda(s)` for states that appear in the replay buffer. Every episode therefore starts from a randomly sampled state, so the policy and the safety value are trained over the feasible set as a whole instead of from a single fixed start.
 
-Each episode samples:
+One `env.reset(...)` call does all of the following, in this order:
 
-1. a **layout** uniformly from the training layouts,
-2. a **start state** via `CorridorEnvironment.sample_random_state` — a position with `vehicle_radius + margin` clearance from the walls and `pillar_radius + vehicle_radius + margin` clearance from every pillar, and a velocity drawn uniformly from a disk of radius `--random-reset-max-speed`, and
-3. a **goal** sampled the same way (with zero velocity), resampled until it is at least `2 * goal_radius` away from the start.
+1. select a **layout** uniformly from the training layouts,
+2. sample a **start state** via `CorridorEnvironment.sample_random_state` on that layout — a position with `vehicle_radius + margin` clearance from the walls and `pillar_radius + vehicle_radius + margin` clearance from every pillar, and a velocity drawn uniformly from a disk of radius `--random-reset-max-speed`, and
+3. sample a **goal** the same way (with zero velocity), resampled until it is at least `2 * goal_radius` away from the start.
+
+Sampling after the layout is selected guarantees the start and goal are feasible for the layout the episode actually runs on.
 
 Full RCRL training runs from step 0 — there is no separate exploration or warm-up phase; exploration comes from the per-step action noise (`--expl-noise`).
 

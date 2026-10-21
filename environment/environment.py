@@ -36,7 +36,10 @@ class CorridorEnvironment(gym.Env):
         self.max_steps = max_steps
         self.current_step = 0
         self.goal = None
-        
+        # Constraint h(s) of the current state, refreshed on reset and after
+        # every step so ``step`` needs only one lidar cast per transition.
+        self._current_constraint = None
+
         self.train_layouts = np.load(f"layouts/{layout_set}_train.npy")
         self.test_layouts = np.load(f"layouts/{layout_set}_test.npy")
         self.val_layouts = np.load(f"layouts/{layout_set}_validation.npy")
@@ -85,17 +88,31 @@ class CorridorEnvironment(gym.Env):
         self.ax = None
 
     def reset(self, *, layout_type="fixed", seed=None, options=None, state=None,
-              layout_index=None, goal=None):
+              layout_index=None, goal=None, sample_start=False,
+              start_margin=0.3, start_max_speed=1.0, goal_margin=0.3,
+              min_start_goal_distance=None):
         """Reset the environment.
 
         ``layout_type`` selects the layout set to load ("train", "test",
         "val"); "fixed" keeps the currently loaded layout. If
         ``layout_index`` is None, a layout is chosen uniformly at random
         from the selected set, otherwise that specific layout is loaded.
-        ``state`` optionally sets the initial dynamics state
-        (x, x_dot, y, y_dot). ``goal`` optionally sets the goal position
-        (x, y) or a goal state (x, x_dot, y, y_dot); when omitted, a new
-        random feasible goal is sampled for the loaded layout.
+
+        Start and goal are sampled on the loaded layout, so a randomized
+        episode needs only this one call:
+
+        - ``state`` optionally sets the initial dynamics state
+          (x, x_dot, y, y_dot). With ``sample_start=True`` and no ``state``,
+          a feasible random start is sampled with ``start_margin`` clearance
+          from walls and pillars and a velocity bounded by
+          ``start_max_speed``.
+        - ``goal`` optionally sets the goal position (x, y) or a goal state
+          (x, x_dot, y, y_dot). When omitted, a feasible goal is sampled with
+          ``goal_margin`` clearance and resampled until it is at least
+          ``min_start_goal_distance`` from the start (when that is set).
+
+        Sampling happens after the layout is selected, so the sampled start
+        and goal are always feasible for the layout the episode runs on.
         """
         super().reset(seed=seed)
 
@@ -109,8 +126,33 @@ class CorridorEnvironment(gym.Env):
                 layout_index = self.np_random.integers(len(layouts[layout_type]))
             self.pillars = layouts[layout_type][layout_index].copy()
 
+        if state is None and sample_start:
+            state = self.sample_random_state(
+                margin=start_margin, max_speed=start_max_speed
+            )
+
         if goal is None:
-            goal = self.sample_random_state(margin=0.3, max_speed=0.0)
+            goal = self.sample_random_state(margin=goal_margin, max_speed=0.0)
+            if min_start_goal_distance is not None and state is not None:
+                start_position = np.asarray(state, dtype=np.float64).reshape(-1)
+                if start_position.size >= 4:
+                    start_x, start_y = start_position[0], start_position[2]
+                else:
+                    start_x, start_y = start_position[0], start_position[1]
+                while True:
+                    goal_position = np.asarray(goal, dtype=np.float64).reshape(-1)
+                    if goal_position.size >= 4:
+                        goal_x, goal_y = goal_position[0], goal_position[2]
+                    else:
+                        goal_x, goal_y = goal_position[0], goal_position[1]
+                    if np.hypot(start_x - goal_x, start_y - goal_y) > (
+                        min_start_goal_distance
+                    ):
+                        break
+                    goal = self.sample_random_state(
+                        margin=goal_margin, max_speed=0.0
+                    )
+
         goal_state = np.asarray(goal, dtype=np.float64).reshape(-1)
         if goal_state.size >= 4:
             # (x, x_dot, y, y_dot) state
@@ -126,7 +168,11 @@ class CorridorEnvironment(gym.Env):
 
         self.current_step = 0
 
-        observation = self._get_observation()
+        # One lidar cast at reset seeds both the observation and the cached
+        # constraint used by the first step.
+        lidar = self.get_lidar()
+        observation = self._get_observation(lidar)
+        self._current_constraint = self._get_lidar_constraint(lidar)
 
         info = {}
 
@@ -153,9 +199,7 @@ class CorridorEnvironment(gym.Env):
 
         for _ in range(max_attempts):
             x = self.np_random.uniform(wall_margin, self.length - margin)
-            y = self.np_random.uniform(
-                -half_width + wall_margin, half_width - wall_margin
-            )
+            y = self.np_random.uniform(-half_width + wall_margin, half_width - wall_margin)
 
             pillar_clear = all(
                 np.hypot(x - pillar_x, y - pillar_y)
@@ -181,8 +225,10 @@ class CorridorEnvironment(gym.Env):
         old_x, _, old_y, _ = self.dynamics.get_state()
         old_goal_distance = np.hypot(old_x - self.goal[0], old_y - self.goal[1])
 
-        # Constraint of the current state, before the action is applied.
-        constraint = self._get_lidar_constraint()
+        # Constraint of the current state, before the action is applied. It
+        # was cached by reset or by the previous step, so no lidar cast is
+        # needed here.
+        constraint = self._current_constraint
 
         # Make sure action obeys acceleration limits
         action = np.clip(action, self.action_space.low, self.action_space.high)
@@ -208,17 +254,20 @@ class CorridorEnvironment(gym.Env):
         # Time limit
         truncated = self.current_step >= self.max_steps
 
-        # Observation AFTER action
-        observation = self._get_observation()
+        # A single lidar cast serves both the observation and the constraint
+        # of the state reached after this action.
+        lidar = self.get_lidar()
+        observation = self._get_observation(lidar)
 
         # Reach-the-goal reward: closer to the goal is better, on top of a
         # small per-step cost, with a bonus for reaching the goal.
-        reward = 5.0 * (old_goal_distance - new_goal_distance) - 0.1
+        reward = 2.5 * (old_goal_distance - new_goal_distance) - 0.1
         if goal_reached:
             reward += 50.0
 
         # Constraint of the state reached after this action.
-        next_constraint = self._get_lidar_constraint()
+        next_constraint = self._get_lidar_constraint(lidar)
+        self._current_constraint = next_constraint
 
         info = {
             "collision": collision,
@@ -235,11 +284,13 @@ class CorridorEnvironment(gym.Env):
             info,
         )
 
-    def _get_observation(self):
+    def _get_observation(self, lidar=None):
         x, x_dot, y, y_dot = self.dynamics.get_state()
 
         velocity = np.array([x_dot, y_dot], dtype=np.float32)
-        lidar = np.array(self.get_lidar(), dtype=np.float32)
+        if lidar is None:
+            lidar = self.get_lidar()
+        lidar = np.array(lidar, dtype=np.float32)
         # Relative goal coordinates tell the policy where the goal is.
         goal_relative = np.array([
             self.goal[0] - x,
@@ -251,8 +302,9 @@ class CorridorEnvironment(gym.Env):
             observation = observation / self.obs_scale
         return observation
 
-    def _get_lidar_constraint(self):
-        lidar = self.get_lidar()
+    def _get_lidar_constraint(self, lidar=None):
+        if lidar is None:
+            lidar = self.get_lidar()
         return self.vehicle_radius - np.min(lidar)
 
     def check_collision(self):
@@ -508,3 +560,198 @@ class CorridorEnvironment(gym.Env):
             self.fig.canvas.draw_idle()
             self.fig.canvas.flush_events()
             plt.pause(0.001)
+
+
+def _step_signature(env):
+    """Parameters that must match for environments to share a batched step."""
+    return (
+        env.length,
+        env.width,
+        env.vehicle_radius,
+        env.lidar_range,
+        env.num_lidar_rays,
+        env.max_acceleration,
+        env.max_steps,
+        env.normalize_obs,
+        env.dynamics.dt,
+        env.dynamics.max_velocity,
+    )
+
+
+def step_batch(envs, actions):
+    """Advance several corridor environments with one vectorized step.
+
+    Equivalent to calling ``CorridorEnvironment.step`` on every environment
+    with the matching row of ``actions``, but dynamics, collision, lidar, and
+    observation math run once over arrays of shape ``(len(envs), ...)``
+    instead of in a Python loop. All environments must share the geometry,
+    dynamics, and observation parameters (they normally come from the same
+    ``create_env`` call); each may use a different layout, goal, and state.
+
+    Like the scalar environment, only one lidar cast is made per step: it
+    supplies both the observation and ``next_constraint``, while
+    ``constraint`` comes from the value cached by the previous step or reset.
+
+    Returns ``(observations, rewards, terminated, truncated, info)``.
+    ``observations`` is shaped ``(N, observation_dim)``; ``rewards``,
+    ``terminated``, and ``truncated`` are shaped ``(N,)``; ``info`` holds the
+    scalar environment's fields as ``(N,)`` arrays.
+    """
+    n = len(envs)
+    if n == 0:
+        raise ValueError("step_batch requires at least one environment")
+    signature = _step_signature(envs[0])
+    if any(_step_signature(env) != signature for env in envs[1:]):
+        raise ValueError(
+            "step_batch requires environments with identical parameters"
+        )
+
+    reference = envs[0]
+    # Keep the environments' state dtype so the batched arithmetic matches
+    # the scalar environment's precision.
+    states = np.array([env.dynamics.get_state() for env in envs])
+    goals = np.array([env.goal for env in envs], dtype=np.float64)
+    x, x_dot, y, y_dot = states.T
+
+    # Double-integrator dynamics, matching DoubleIntegratorExactDiscretization.
+    actions = np.clip(
+        actions, reference.action_space.low, reference.action_space.high
+    )
+    acceleration = actions * reference.max_acceleration
+    dt = reference.dynamics.dt
+    new_x_dot = x_dot + acceleration[:, 0] * dt
+    new_y_dot = y_dot + acceleration[:, 1] * dt
+
+    # Same norm as ``np.linalg.norm`` in the scalar dynamics update.
+    speed = np.sqrt(new_x_dot**2 + new_y_dot**2)
+    too_fast = speed > reference.dynamics.max_velocity
+    if np.any(too_fast):
+        new_x_dot[too_fast] = (
+            new_x_dot[too_fast] / speed[too_fast] * reference.dynamics.max_velocity
+        )
+        new_y_dot[too_fast] = (
+            new_y_dot[too_fast] / speed[too_fast] * reference.dynamics.max_velocity
+        )
+
+    new_x = x + 0.5 * (x_dot + new_x_dot) * dt
+    new_y = y + 0.5 * (y_dot + new_y_dot) * dt
+
+    # Lidar: wall and left-wall intersections for every (env, ray) pair.
+    angles = np.linspace(0.0, 2.0 * np.pi, reference.num_lidar_rays, endpoint=False)
+    direction_x = np.cos(angles)
+    direction_y = np.sin(angles)
+
+    distances = np.full((n, reference.num_lidar_rays), reference.lidar_range)
+
+    vertical = np.abs(direction_y) >= 1e-6
+    t_wall = np.full((n, reference.num_lidar_rays), np.inf)
+    wall_y = np.where(
+        direction_y[vertical] > 0, reference.width / 2, -reference.width / 2
+    )
+    t_wall[:, vertical] = (
+        wall_y[None, :] - new_y[:, None]
+    ) / direction_y[vertical][None, :]
+    t_wall[t_wall < 0.0] = np.inf
+
+    horizontal = np.abs(direction_x) >= 1e-6
+    t_left = np.full((n, reference.num_lidar_rays), np.inf)
+    t_left[:, horizontal] = (0.0 - new_x[:, None]) / direction_x[horizontal][None, :]
+    t_left[t_left < 0.0] = np.inf
+
+    distances = np.minimum(distances, np.minimum(t_wall, t_left))
+
+    # Pillars are padded to a common count and masked out by ``valid``. Keep
+    # their dtype so the arithmetic matches the scalar environment.
+    pillars = [np.asarray(env.pillars) for env in envs]
+    max_pillars = max((len(p) for p in pillars), default=0)
+    if max_pillars > 0:
+        centers = np.zeros(
+            (n, max_pillars, 3),
+            dtype=np.result_type(*(p.dtype for p in pillars)),
+        )
+        valid = np.zeros((n, max_pillars), dtype=bool)
+        for i, env_pillars in enumerate(pillars):
+            centers[i, : len(env_pillars)] = env_pillars
+            valid[i, : len(env_pillars)] = True
+
+        pillar_x = centers[:, :, 0]
+        pillar_y = centers[:, :, 1]
+        pillar_radius = centers[:, :, 2]
+
+        offset_x = new_x[:, None] - pillar_x
+        offset_y = new_y[:, None] - pillar_y
+        b = 2.0 * (
+            direction_x[None, :, None] * offset_x[:, None, :]
+            + direction_y[None, :, None] * offset_y[:, None, :]
+        )
+        c = offset_x**2 + offset_y**2 - pillar_radius**2
+        discriminant = b**2 - 4.0 * c[:, None, :]
+        sqrt_discriminant = np.sqrt(
+            np.where(discriminant >= 0.0, discriminant, 0.0)
+        )
+
+        t1 = (-b - sqrt_discriminant) / 2.0
+        t2 = (-b + sqrt_discriminant) / 2.0
+        hit = (discriminant >= 0.0) & valid[:, None, :]
+        t1 = np.where(hit & (t1 >= 0.0), t1, np.inf)
+        t2 = np.where(hit & (t2 >= 0.0), t2, np.inf)
+        pillar_distance = np.minimum(t1, t2).min(axis=2)
+        distances = np.minimum(distances, pillar_distance)
+
+    # Observation: velocity, lidar, goal-relative coordinates.
+    observations = np.concatenate(
+        (
+            new_x_dot[:, None].astype(np.float32),
+            new_y_dot[:, None].astype(np.float32),
+            distances.astype(np.float32),
+            (goals[:, 0] - new_x)[:, None].astype(np.float32),
+            (goals[:, 1] - new_y)[:, None].astype(np.float32),
+        ),
+        axis=1,
+    )
+    if reference.normalize_obs:
+        observations = observations / reference.obs_scale
+
+    old_goal_distance = np.hypot(x - goals[:, 0], y - goals[:, 1])
+    new_goal_distance = np.hypot(new_x - goals[:, 0], new_y - goals[:, 1])
+    goal_reached = new_goal_distance <= reference.goal_radius
+
+    collision = (
+        (new_y + reference.vehicle_radius >= reference.width / 2)
+        | (new_y - reference.vehicle_radius <= -reference.width / 2)
+        | (new_x - reference.vehicle_radius <= 0.0)
+    )
+    if max_pillars > 0:
+        collision |= (
+            (
+                np.hypot(new_x[:, None] - pillar_x, new_y[:, None] - pillar_y)
+                <= reference.vehicle_radius + pillar_radius
+            )
+            & valid
+        ).any(axis=1)
+
+    terminated = collision | goal_reached
+    steps = np.array([env.current_step for env in envs]) + 1
+    truncated = steps >= reference.max_steps
+
+    rewards = 2.5 * (old_goal_distance - new_goal_distance) - 0.1
+    rewards[goal_reached] += 50.0
+
+    constraint = np.array(
+        [env._current_constraint for env in envs], dtype=np.float64
+    )
+    next_constraint = reference.vehicle_radius - distances.min(axis=1)
+
+    new_states = np.stack((new_x, new_x_dot, new_y, new_y_dot), axis=1)
+    for i, env in enumerate(envs):
+        env.dynamics.state = new_states[i].copy()
+        env.current_step = int(steps[i])
+        env._current_constraint = next_constraint[i]
+
+    info = {
+        "collision": collision,
+        "goal_reached": goal_reached,
+        "constraint": constraint,
+        "next_constraint": next_constraint,
+    }
+    return observations, rewards, terminated, truncated, info

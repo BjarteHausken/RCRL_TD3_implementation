@@ -79,7 +79,10 @@ class MultiplierNetwork(nn.Module):
         self.l2 = nn.Linear(256, 256)
         self.l3 = nn.Linear(256, 1)
         self.max_lambda = max_lambda
+        # Start with lambda(s) == initial_lambda for every state: the random
+        # output weights are zeroed so only the bias sets the softplus input.
         initial_logit = math.log(math.expm1(initial_lambda))
+        nn.init.zeros_(self.l3.weight)
         nn.init.constant_(self.l3.bias, initial_logit)
 
     def forward(self, state):
@@ -140,18 +143,12 @@ class RCRLTD3:
 
         self.safety_critic = SafetyCritic(state_dim, action_dim).to(device)
         self.safety_critic_target = copy.deepcopy(self.safety_critic)
-        self.safety_critic_optimizer = torch.optim.Adam(
-            self.safety_critic.parameters(), lr=safety_lr
-        )
+        self.safety_critic_optimizer = torch.optim.Adam(self.safety_critic.parameters(), lr=safety_lr)
 
         self.multiplier_type = multiplier_type
         if multiplier_type == "network":
-            self.multiplier = MultiplierNetwork(
-                state_dim, max_lambda, initial_lambda
-            ).to(device)
-            self.multiplier_optimizer = torch.optim.Adam(
-                self.multiplier.parameters(), lr=multiplier_lr
-            )
+            self.multiplier = MultiplierNetwork(state_dim, max_lambda, initial_lambda).to(device)
+            self.multiplier_optimizer = torch.optim.Adam(self.multiplier.parameters(), lr=multiplier_lr)
         else:
             # A fixed Lagrange multiplier shared by all states, set by the
             # user via --initial-lambda and never updated during training.
@@ -171,9 +168,7 @@ class RCRLTD3:
     def multiplier_for(self, state):
         """Lagrange multiplier as a (batch, 1) tensor for this state."""
         if self.multiplier_type == "scalar":
-            return torch.full(
-                (state.shape[0], 1), self.fixed_lambda, device=device
-            )
+            return torch.full((state.shape[0], 1), self.fixed_lambda, device=device)
         return self.multiplier(state)
 
     def mean_lambda(self, state):
@@ -190,9 +185,7 @@ class RCRLTD3:
     @staticmethod
     def _soft_update(source, target, tau):
         for parameter, target_parameter in zip(source.parameters(), target.parameters()):
-            target_parameter.data.copy_(
-                tau * parameter.data + (1.0 - tau) * target_parameter.data
-            )
+            target_parameter.data.copy_(tau * parameter.data + (1.0 - tau) * target_parameter.data)
 
     @staticmethod
     def _set_requires_grad(modules, requires_grad):

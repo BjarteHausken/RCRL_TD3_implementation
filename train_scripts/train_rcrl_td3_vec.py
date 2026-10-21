@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 from agents.rcrl_td3 import RCRLTD3, device
-from environment import create_env
+from environment import create_env, step_batch
 from train_scripts.train_rcrl_td3 import (
     episode_reset,
     evaluate_policy,
@@ -92,13 +92,16 @@ def main(args):
         "action_dim": action_dim,
         "max_action": max_action,
         "device": str(device),
-        "dt": 0.1,
-        "max_velocity": 3.0,
-        "corridor_length": 30.0,
-        "corridor_width": 5.0,
-        "lidar_range": 5.0,
-        "num_lidar_rays": 64,
+        "dt": envs[0].dynamics.dt,
+        "max_velocity": envs[0].dynamics.max_velocity,
+        "corridor_length": envs[0].length,
+        "corridor_width": envs[0].width,
+        "vehicle_radius": envs[0].vehicle_radius,
+        "lidar_range": envs[0].lidar_range,
+        "num_lidar_rays": envs[0].num_lidar_rays,
+        "max_acceleration": envs[0].max_acceleration,
         "goal_radius": envs[0].goal_radius,
+        "max_steps": envs[0].max_steps,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
@@ -114,18 +117,18 @@ def main(args):
     observations = np.empty((args.num_envs, state_dim), dtype=np.float32)
     for i, env in enumerate(envs):
         env.action_space.seed(args.seed + i)
-        # The first reset seeds the environment RNG; episode_reset then
-        # picks the layout and the random start and goal states.
-        env.reset(layout_type="train", seed=args.seed + i)
+        # The first episode reset also seeds the environment RNG.
         observation, _ = episode_reset(
-            env, args.random_reset_margin, args.random_reset_max_speed
+            env,
+            args.random_reset_margin,
+            args.random_reset_max_speed,
+            seed=args.seed + i,
         )
         observations[i] = observation
 
     # Per-step batched transition storage, filled by the stepping loop.
     states = np.empty((args.num_envs, state_dim), dtype=np.float32)
     actions = np.empty((args.num_envs, action_dim), dtype=np.float32)
-    next_states = np.empty((args.num_envs, state_dim), dtype=np.float32)
     rewards = np.empty((args.num_envs, 1), dtype=np.float32)
     constraints = np.empty((args.num_envs, 1), dtype=np.float32)
     next_constraints = np.empty((args.num_envs, 1), dtype=np.float32)
@@ -159,26 +162,28 @@ def main(args):
         )
         actions[:] = np.clip(policy_actions + noise, -max_action, max_action)
 
+        states[:] = observations
+        next_states, step_rewards, terminated, truncated, info = step_batch(
+            envs, actions
+        )
+        rewards[:, 0] = step_rewards
+        constraints[:, 0] = info["constraint"]
+        next_constraints[:, 0] = info["next_constraint"]
+        # Collisions and goals terminate; time-limit truncations keep
+        # bootstrap targets, matching the sequential trainer.
+        dones[:, 0] = terminated
+
+        # Episode bookkeeping and resets stay per environment; only the
+        # environment stepping itself is batched.
         for i, env in enumerate(envs):
-            next_state, reward, terminated, truncated, info = env.step(actions[i])
-
-            states[i] = observations[i]
-            next_states[i] = next_state
-            rewards[i, 0] = reward
-            constraints[i, 0] = info["constraint"]
-            next_constraints[i, 0] = info["next_constraint"]
-            # Collisions and goals terminate; time-limit truncations keep
-            # bootstrap targets, matching the sequential trainer.
-            dones[i, 0] = float(terminated)
-
-            episode_reward[i] += reward
+            episode_reward[i] += step_rewards[i]
             episode_steps[i] += 1
 
-            if terminated or truncated:
+            if terminated[i] or truncated[i]:
                 window_rewards.append(episode_reward[i])
                 window_lengths.append(episode_steps[i])
-                window_collisions += int(info["collision"])
-                window_goals += int(info["goal_reached"])
+                window_collisions += int(info["collision"][i])
+                window_goals += int(info["goal_reached"][i])
                 observation, _ = episode_reset(
                     env, args.random_reset_margin, args.random_reset_max_speed
                 )
@@ -186,7 +191,7 @@ def main(args):
                 episode_reward[i] = 0.0
                 episode_steps[i] = 0
             else:
-                observations[i] = next_state
+                observations[i] = next_states[i]
 
         replay_buffer.add_batch(
             states,
@@ -232,13 +237,20 @@ def main(args):
         if next_eval is not None and env_steps_done >= next_eval:
             next_eval += args.eval_freq
             results = evaluate_policy(
-                policy, args.layout_set, args.normalize_obs
+                policy,
+                args.layout_set,
+                args.normalize_obs,
+                episodes_per_layout=args.eval_episodes_per_layout,
+                random_reset_margin=args.random_reset_margin,
+                random_reset_max_speed=args.random_reset_max_speed,
             )
             print(
                 f"Evaluation at {env_steps_done}: "
                 f"mean_reward={results['mean_reward']:.3f}, "
                 f"mean_steps={results['mean_steps']:.1f}, "
-                f"success_rate={results['success_rate']:.1%}, "
+                f"success_rate={results['success_rate']:.1%} "
+                f"(95% CI {results['success_rate_ci'][0]:.1%}-"
+                f"{results['success_rate_ci'][1]:.1%}), "
                 f"collision_rate={results['collision_rate']:.1%}"
             )
             policy.save(model_path)
@@ -285,7 +297,7 @@ def parse_args():
     parser.add_argument("--expl-noise", type=float, default=0.1)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--policy-noise", type=float, default=0.2)
+    parser.add_argument("--policy-noise", type=float, default=0.1)
     parser.add_argument("--noise-clip", type=float, default=0.5)
     parser.add_argument("--policy-freq", type=int, default=2)
     parser.add_argument("--critic-lr", type=float, default=1e-4)
@@ -304,7 +316,7 @@ def parse_args():
              "--initial-lambda and not updated during training",
     )
     parser.add_argument("--max-lambda", type=float, default=100.0)
-    parser.add_argument("--initial-lambda", type=float, default=0.1)
+    parser.add_argument("--initial-lambda", type=float, default=10.0)
     parser.add_argument("--random-reset-margin", type=float, default=0.3,
                         help="Extra clearance (m) beyond the collision "
                              "boundary for sampled start and goal states")
@@ -312,6 +324,9 @@ def parse_args():
                         help="Maximum speed (m/s) of the sampled start velocity")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
+    parser.add_argument("--eval-episodes-per-layout", type=int, default=20,
+                        help="Episodes with sampled start/goal pairs to run "
+                             "on each validation layout during evaluation")
     parser.add_argument("--log-freq", type=int, default=1_000,
                         help="Set to 0 to disable progress logging")
     args = parser.parse_args()
@@ -332,6 +347,8 @@ def parse_args():
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:
         parser.error("--random-reset-max-speed must be positive")
+    if args.eval_episodes_per_layout < 1:
+        parser.error("--eval-episodes-per-layout must be positive")
     return args
 
 

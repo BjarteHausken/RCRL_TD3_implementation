@@ -108,7 +108,7 @@ def draw_environment():
 
     # Information
     speed = np.sqrt(x_dot**2 + y_dot**2)
-    constraints = env.get_lidar_constraint()
+    constraints = env._get_lidar_constraint()
 
     ax.set_title(
         f"Speed: {speed:.2f} m/s | "

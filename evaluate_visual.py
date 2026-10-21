@@ -1,9 +1,6 @@
 import argparse
-import json
 import time
 import os
-
-import numpy as np
 
 import matplotlib
 from PIL import Image
@@ -11,6 +8,7 @@ from PIL import Image
 from agents.td3 import TD3
 from agents.rcrl_td3 import RCRLTD3
 from environment import create_env
+from evaluate import load_config
 
 
 def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one",
@@ -20,6 +18,7 @@ def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one",
         matplotlib.use("Agg")
 
     env = create_env(layout_set, normalize_obs=normalize_obs)
+    config = load_config(MODEL_PATH)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -28,11 +27,16 @@ def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one",
     if agent_type == "td3":
         policy = TD3(state_dim, action_dim, max_action)
     else:
-        # The multiplier type is a property of the checkpoint, not of the
+        # Agent hyperparameters are a property of the checkpoint, not of the
         # evaluation: reconstruct the agent the run was trained with.
-        with open(os.path.join(os.path.dirname(MODEL_PATH), "config.json")) as f:
-            multiplier_type = json.load(f)["multiplier"]
-        policy = RCRLTD3(state_dim, action_dim, max_action, multiplier_type=multiplier_type)
+        policy = RCRLTD3(
+            state_dim,
+            action_dim,
+            max_action,
+            multiplier_type=config.get("multiplier", "scalar"),
+            max_lambda=config.get("max_lambda", 100.0),
+            initial_lambda=config.get("initial_lambda", 10.0),
+        )
     policy.load(MODEL_PATH)
     print("Loaded model:", MODEL_PATH)
 
@@ -45,14 +49,21 @@ def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one",
                 f"Test layout index must be between 0 and {len(env.test_layouts) - 1}"
             )
 
-    # Same randomized regime as training: one sampled feasible start and
-    # one sampled feasible goal, seeded by layout index for reproducibility.
-    env.reset(layout_type="test", layout_index=layout_idx, seed=layout_idx)
-    start = env.sample_random_state(margin=0.3, max_speed=1.0)
-    goal = env.sample_random_state(margin=0.3, max_speed=0.0)
-    while np.hypot(start[0] - goal[0], start[1] - goal[1]) <= 2 * env.goal_radius:
-        goal = env.sample_random_state(margin=0.3, max_speed=0.0)
-    state, info = env.reset(layout_type="fixed", state=start, goal=goal)
+    # Same randomized regime as training: one sampled feasible start and one
+    # sampled feasible goal on the selected layout, seeded by layout index
+    # for reproducibility.
+    random_reset_margin = config.get("random_reset_margin", 0.3)
+    random_reset_max_speed = config.get("random_reset_max_speed", 1.0)
+    state, info = env.reset(
+        layout_type="test",
+        layout_index=layout_idx,
+        seed=layout_idx,
+        sample_start=True,
+        start_margin=random_reset_margin,
+        start_max_speed=random_reset_max_speed,
+        goal_margin=random_reset_margin,
+        min_start_goal_distance=2 * env.goal_radius,
+    )
     print(f"Test layout: {layout_idx}" + (" (random)" if test_layout == "random" else ""))
     
     episode_reward = 0

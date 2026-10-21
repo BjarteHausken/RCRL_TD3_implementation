@@ -1,5 +1,5 @@
 from environment.dynamics import DoubleIntegratorExactDiscretization
-from environment.environment import CorridorEnvironment
+from environment.environment import CorridorEnvironment, step_batch
 
 
 def create_env(
