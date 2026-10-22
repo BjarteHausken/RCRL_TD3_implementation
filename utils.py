@@ -7,12 +7,12 @@ class ReplayBuffer(object):
         self.ptr = 0
         self.size = 0
 
-        self.state = np.zeros((max_size, state_dim))
-        self.action = np.zeros((max_size, action_dim))
-        self.next_state = np.zeros((max_size, state_dim))
-        self.reward = np.zeros((max_size, 1))
-        self.next_constraint = np.zeros((max_size, 1))
-        self.not_done = np.zeros((max_size, 1))
+        self.state = np.zeros((max_size, state_dim), dtype=np.float32)
+        self.action = np.zeros((max_size, action_dim), dtype=np.float32)
+        self.next_state = np.zeros((max_size, state_dim), dtype=np.float32)
+        self.reward = np.zeros((max_size, 1), dtype=np.float32)
+        self.next_constraint = np.zeros((max_size, 1), dtype=np.float32)
+        self.not_done = np.zeros((max_size, 1), dtype=np.float32)
 
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -45,13 +45,13 @@ class ReplayBufferRCRLTD3(object):
         self.ptr = 0
         self.size = 0
 
-        self.state = np.zeros((max_size, state_dim))
-        self.action = np.zeros((max_size, action_dim))
-        self.next_state = np.zeros((max_size, state_dim))
-        self.reward = np.zeros((max_size, 1))
-        self.h = np.zeros((max_size, 1))
-        self.next_h = np.zeros((max_size, 1))
-        self.not_done = np.zeros((max_size, 1))
+        self.state = np.zeros((max_size, state_dim), dtype=np.float32)
+        self.action = np.zeros((max_size, action_dim), dtype=np.float32)
+        self.next_state = np.zeros((max_size, state_dim), dtype=np.float32)
+        self.reward = np.zeros((max_size, 1), dtype=np.float32)
+        self.h = np.zeros((max_size, 1), dtype=np.float32)
+        self.next_h = np.zeros((max_size, 1), dtype=np.float32)
+        self.not_done = np.zeros((max_size, 1), dtype=np.float32)
 
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -117,7 +117,7 @@ class ReplayBufferTD3Torch(object):
 
     def _write(self, store, values):
         """Write a (batch, dim) batch at ``self.ptr``, wrapping the ring."""
-        values = torch.as_tensor(np.asarray(values, dtype=np.float32))
+        values = torch.as_tensor(values, dtype=torch.float32, device=self.device)
         if values.dim() == 1:
             values = values.unsqueeze(1)
         n = values.shape[0]
@@ -186,7 +186,7 @@ class ReplayBufferRCRLTD3Torch(object):
 
     def _write(self, store, values):
         """Write a (batch, dim) batch at ``self.ptr``, wrapping the ring."""
-        values = torch.as_tensor(np.asarray(values, dtype=np.float32))
+        values = torch.as_tensor(values, dtype=torch.float32, device=self.device)
         if values.dim() == 1:
             values = values.unsqueeze(1)
         n = values.shape[0]

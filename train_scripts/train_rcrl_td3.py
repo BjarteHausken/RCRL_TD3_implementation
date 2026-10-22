@@ -114,76 +114,85 @@ def main(args):
     episode_steps = 0
     episode_num = 0
 
-    for timestep in range(args.max_timesteps):
-        episode_steps += 1
-        action = policy.select_action(state)
-        noise = np.random.normal(
-            loc=0.0,
-            scale=max_action * args.expl_noise,
-            size=action_dim,
-        )
-        action = np.clip(action + noise, -max_action, max_action)
+    try:
+        for timestep in range(args.max_timesteps):
+            episode_steps += 1
+            action = policy.select_action(state)
+            noise = np.random.normal(
+                loc=0.0,
+                scale=max_action * args.expl_noise,
+                size=action_dim,
+            )
+            action = np.clip(action + noise, -max_action, max_action)
 
-        next_state, reward, terminated, truncated, info = env.step(action)
-        episode_reward += reward
+            next_state, reward, terminated, truncated, info = env.step(action)
+            episode_reward += reward
 
-        # info["constraint"] is h(s) and info["next_constraint"] is h(s').
-        # Time-limit truncations retain bootstrap targets; collisions and goals do not.
-        replay_buffer.add(
-            state,
-            action,
-            next_state,
-            reward,
-            info["constraint"],
-            info["next_constraint"],
-            float(terminated),
-        )
-        state = next_state
+            # info["constraint"] is h(s) and info["next_constraint"] is h(s').
+            # Time-limit truncations retain bootstrap targets; collisions and goals do not.
+            replay_buffer.add(
+                state,
+                action,
+                next_state,
+                reward,
+                info["constraint"],
+                info["next_constraint"],
+                float(terminated),
+            )
+            state = next_state
 
-        if replay_buffer.size >= args.batch_size:
-            policy.train(replay_buffer, batch_size=args.batch_size)
+            if replay_buffer.size >= args.batch_size:
+                policy.train(replay_buffer, batch_size=args.batch_size)
 
-        if terminated or truncated:
-            if episode_num % 20 == 0:
-                print(
-                    f"Episode {episode_num:4d} | step {timestep + 1:7d} | "
-                    f"length {episode_steps:4d} | reward {episode_reward:8.3f} | "
-                    f"collision {info['collision']} | goal {info['goal_reached']}"
+            if terminated or truncated:
+                if episode_num % 20 == 0:
+                    print(
+                        f"Episode {episode_num:4d} | step {timestep + 1:7d} | "
+                        f"length {episode_steps:4d} | reward {episode_reward:8.3f} | "
+                        f"collision {info['collision']} | goal {info['goal_reached']}"
+                    )
+                state, _ = episode_reset(
+                    env, args.random_reset_margin, args.random_reset_max_speed
                 )
-            state, _ = episode_reset(
-                env, args.random_reset_margin, args.random_reset_max_speed
-            )
-            episode_reward = 0.0
-            episode_steps = 0
-            episode_num += 1
+                episode_reward = 0.0
+                episode_steps = 0
+                episode_num += 1
 
-        if args.log_freq > 0 and (timestep + 1) % args.log_freq == 0:
-            with torch.no_grad():
-                mean_lambda = policy.mean_lambda(state)
-            print(
-                f"Step {timestep + 1}: replay_size={replay_buffer.size}, "
-                f"mean_lambda={mean_lambda:.4f}"
-            )
+            if args.log_freq > 0 and (timestep + 1) % args.log_freq == 0:
+                with torch.no_grad():
+                    mean_lambda = policy.mean_lambda(state)
+                print(
+                    f"Step {timestep + 1}: replay_size={replay_buffer.size}, "
+                    f"mean_lambda={mean_lambda:.4f}"
+                )
 
-        if args.eval_freq > 0 and (timestep + 1) % args.eval_freq == 0:
-            results = evaluate_policy(
-                policy,
-                args.layout_set,
-                args.normalize_obs,
-                episodes_per_layout=args.eval_episodes_per_layout,
-                random_reset_margin=args.random_reset_margin,
-                random_reset_max_speed=args.random_reset_max_speed,
-            )
-            print(
-                f"Evaluation at {timestep + 1}: "
-                f"mean_reward={results['mean_reward']:.3f}, "
-                f"mean_steps={results['mean_steps']:.1f}, "
-                f"success_rate={results['success_rate']:.1%} "
-                f"(95% CI {results['success_rate_ci'][0]:.1%}-"
-                f"{results['success_rate_ci'][1]:.1%}), "
-                f"collision_rate={results['collision_rate']:.1%}"
-            )
-            policy.save(model_path)
+            if args.save_freq > 0 and (timestep + 1) % args.save_freq == 0:
+                policy.save(model_path)
+                print(f"Step {timestep + 1}: checkpoint saved to {model_path}")
+
+            if args.eval_freq > 0 and (timestep + 1) % args.eval_freq == 0:
+                results = evaluate_policy(
+                    policy,
+                    args.layout_set,
+                    args.normalize_obs,
+                    episodes_per_layout=args.eval_episodes_per_layout,
+                    random_reset_margin=args.random_reset_margin,
+                    random_reset_max_speed=args.random_reset_max_speed,
+                )
+                print(
+                    f"Evaluation at {timestep + 1}: "
+                    f"mean_reward={results['mean_reward']:.3f}, "
+                    f"mean_steps={results['mean_steps']:.1f}, "
+                    f"success_rate={results['success_rate']:.1%} "
+                    f"(95% CI {results['success_rate_ci'][0]:.1%}-"
+                    f"{results['success_rate_ci'][1]:.1%}), "
+                    f"collision_rate={results['collision_rate']:.1%}"
+                )
+                policy.save(model_path)
+    except KeyboardInterrupt:
+        policy.save(model_path)
+        print(f"Interrupted. Checkpoint saved to: {model_path}")
+        return
 
     policy.save(model_path)
     print(f"Training complete. Model saved to: {model_path}")
@@ -247,6 +256,10 @@ def parse_args():
                         help="Maximum speed (m/s) of the sampled start velocity")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
+    parser.add_argument("--save-freq", type=int, default=5_000,
+                        help="Save a checkpoint every this many steps, "
+                             "independent of evaluation; 0 disables "
+                             "intermediate saves (default: 5000)")
     parser.add_argument("--eval-episodes-per-layout", type=int, default=20,
                         help="Episodes with sampled start/goal pairs to run "
                              "on each validation layout during evaluation")
@@ -270,6 +283,8 @@ def parse_args():
         parser.error("--random-reset-max-speed must be positive")
     if args.eval_episodes_per_layout < 1:
         parser.error("--eval-episodes-per-layout must be positive")
+    if args.save_freq < 0:
+        parser.error("--save-freq must be nonnegative")
     return args
 
 

@@ -1,4 +1,5 @@
 import numpy as np
+from environment import create_env, step_batch
 from environment.dynamics import DoubleIntegratorExactDiscretization
 from environment.environment import CorridorEnvironment
 from gymnasium.utils.env_checker import check_env
@@ -18,6 +19,9 @@ for i in range(60):
 """
 
 def test_collisions(env):
+    # A reset gives render() a goal; the per-case states below then override
+    # the dynamics state directly.
+    env.reset(layout_type="fixed", state=[5.0, 0.0, 0.0, 0.0], goal=[15.0, 0.0])
 
     test_cases = [
         # name, state, expected collision
@@ -263,12 +267,107 @@ def test_goal(env):
     assert reward >= 50.0 - 0.1 - 1e-6, reward
     print(f"PASS: goal reached terminates with bonus (reward={reward:.3f})")
 
+def test_batch_matches_single():
+    # The hand-vectorized step_batch must reproduce scalar step() exactly,
+    # so a fixed layout, goal, and start state are shared by both envs.
+    state = [10.0, 0.5, 1.0, -0.3]
+    goal = [20.0, -1.0]
+    env_a = create_env("one")
+    env_b = create_env("one")
+    for env in (env_a, env_b):
+        env.reset(layout_type="train", layout_index=0, state=state, goal=goal)
 
-#test_collisions(env)
+    action = np.array([0.5, -0.25])
+    obs_a, reward_a, terminated_a, truncated_a, info_a = env_a.step(action)
+    obs_b, reward_b, terminated_b, truncated_b, info_b = step_batch(
+        [env_b], [action]
+    )
+
+    np.testing.assert_allclose(
+        env_a.dynamics.get_state(), env_b.dynamics.get_state(), atol=1e-6
+    )
+    np.testing.assert_allclose(obs_a, obs_b[0], atol=1e-6)
+    assert np.isclose(reward_a, reward_b[0], atol=1e-9), (reward_a, reward_b)
+    assert bool(terminated_a) == bool(terminated_b[0])
+    assert bool(truncated_a) == bool(truncated_b[0])
+    np.testing.assert_allclose(
+        info_a["constraint"], info_b["constraint"][0], atol=1e-9
+    )
+    np.testing.assert_allclose(
+        info_a["next_constraint"], info_b["next_constraint"][0], atol=1e-9
+    )
+    assert bool(info_a["collision"]) == bool(info_b["collision"][0])
+    assert bool(info_a["goal_reached"]) == bool(info_b["goal_reached"][0])
+    print("PASS: step_batch matches step")
+
+def test_randomized_reset(env):
+    # Sampled starts and goals from reset() must clear walls (including the
+    # back wall) and pillars by the requested margin, and the goal must stay
+    # at least two goal radii from the start.
+    margin = 0.3
+    for _ in range(20):
+        env.reset(
+            layout_type="train",
+            sample_start=True,
+            start_margin=margin,
+            start_max_speed=1.0,
+            goal_margin=margin,
+            min_start_goal_distance=2 * env.goal_radius,
+        )
+        x, x_dot, y, y_dot = env.dynamics.get_state()
+        assert not env.check_collision(), f"sampled start collides: {x}, {y}"
+        assert env.width / 2 - abs(y) - env.vehicle_radius >= margin - 1e-6
+        assert x - env.vehicle_radius - margin >= -1e-6
+        assert env.length - x - env.vehicle_radius - margin >= -1e-6
+        for pillar_x, pillar_y, pillar_radius in env.pillars:
+            assert np.hypot(x - pillar_x, y - pillar_y) >= (
+                pillar_radius + env.vehicle_radius + margin - 1e-6
+            ), f"start too close to pillar: {x}, {y}"
+        assert np.hypot(x_dot, y_dot) <= 1.0 + 1e-6
+
+        goal_x, goal_y = env.goal
+        assert env.width / 2 - abs(goal_y) - env.vehicle_radius >= margin - 1e-6
+        assert goal_x - env.vehicle_radius - margin >= -1e-6
+        assert env.length - goal_x - env.vehicle_radius - margin >= -1e-6
+        for pillar_x, pillar_y, pillar_radius in env.pillars:
+            assert np.hypot(goal_x - pillar_x, goal_y - pillar_y) >= (
+                pillar_radius + env.vehicle_radius + margin - 1e-6
+            ), f"goal too close to pillar: {goal_x}, {goal_y}"
+        assert np.hypot(x - goal_x, y - goal_y) >= 2 * env.goal_radius - 1e-6
+
+    print("PASS: randomized reset start and goal respect margins")
+
+def test_back_wall(env):
+    # The corridor is closed at the goal end: touching or crossing
+    # x = length - vehicle_radius collides, and lidar sees the wall.
+    env.dynamics.state = np.array(
+        [env.length - env.vehicle_radius + 0.01, 0.0, 0.0, 0.0]
+    )
+    assert env.check_collision(), "back wall collision not detected"
+
+    env.dynamics.state = np.array(
+        [env.length - env.vehicle_radius - 0.1, 0.0, 0.0, 0.0]
+    )
+    assert not env.check_collision(), "back wall false positive"
+
+    env.reset(layout_type="fixed", state=[env.length - 1.0, 0.0, 0.0, 0.0],
+              goal=[0.0, 0.0])
+    lidar = env.get_lidar()
+    # Ray 0 points straight down the +x axis: exactly 1.0 m to the wall.
+    assert np.isfinite(lidar[0])
+    np.testing.assert_allclose(lidar[0], env.length - (env.length - 1.0),
+                               atol=1e-6)
+    print("PASS: back wall collision and lidar")
+
+
 #test_render(env)
-#test_lidar(env)
+test_collisions(env)
+test_lidar(env)
 test_gymnasium_env(env)
 test_random_state_sampling(env)
+test_randomized_reset(env)
 test_goal(env)
+test_batch_matches_single()
+test_back_wall(env)
 #test_velocity_limit(dynamics)
-#test_reward_and_constraints(env)
+test_reward_and_constraints(env)

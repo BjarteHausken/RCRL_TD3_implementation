@@ -137,108 +137,119 @@ def main(args):
     env_steps_done = 0
     next_log = args.log_freq if args.log_freq > 0 else None
     next_eval = args.eval_freq if args.eval_freq > 0 else None
+    next_save = args.save_freq if args.save_freq > 0 else None
     start_time = time.perf_counter()
 
     meta_steps = -(-args.max_timesteps // args.num_envs)  # ceil division
-    for _ in range(meta_steps):
-        # One actor forward pass for all environments.
-        obs_tensor = torch.as_tensor(
-            observations, dtype=torch.float32, device=device
-        )
-        with torch.no_grad():
-            policy_actions = policy.actor(obs_tensor).cpu().numpy()
-        noise = np.random.normal(
-            loc=0.0,
-            scale=max_action * args.expl_noise,
-            size=(args.num_envs, action_dim),
-        )
-        actions[:] = np.clip(policy_actions + noise, -max_action, max_action)
+    try:
+        for _ in range(meta_steps):
+            # One actor forward pass for all environments.
+            obs_tensor = torch.as_tensor(
+                observations, dtype=torch.float32, device=device
+            )
+            with torch.no_grad():
+                policy_actions = policy.actor(obs_tensor).cpu().numpy()
+            noise = np.random.normal(
+                loc=0.0,
+                scale=max_action * args.expl_noise,
+                size=(args.num_envs, action_dim),
+            )
+            actions[:] = np.clip(policy_actions + noise, -max_action, max_action)
 
-        states[:] = observations
-        next_states, step_rewards, terminated, truncated, info = step_batch(
-            envs, actions
-        )
-        rewards[:, 0] = step_rewards
-        # Collisions and goals terminate; time-limit truncations keep
-        # bootstrap targets, matching the sequential trainer.
-        dones[:, 0] = terminated
+            states[:] = observations
+            next_states, step_rewards, terminated, truncated, info = step_batch(
+                envs, actions
+            )
+            rewards[:, 0] = step_rewards
+            # Collisions and goals terminate; time-limit truncations keep
+            # bootstrap targets, matching the sequential trainer.
+            dones[:, 0] = terminated
 
-        # Episode bookkeeping and resets stay per environment; only the
-        # environment stepping itself is batched.
-        for i, env in enumerate(envs):
-            episode_reward[i] += step_rewards[i]
-            episode_steps[i] += 1
+            # Episode bookkeeping and resets stay per environment; only the
+            # environment stepping itself is batched.
+            for i, env in enumerate(envs):
+                episode_reward[i] += step_rewards[i]
+                episode_steps[i] += 1
 
-            if terminated[i] or truncated[i]:
-                window_rewards.append(episode_reward[i])
-                window_lengths.append(episode_steps[i])
-                window_collisions += int(info["collision"][i])
-                window_goals += int(info["goal_reached"][i])
-                observation, _ = episode_reset(
-                    env, args.random_reset_margin, args.random_reset_max_speed
+                if terminated[i] or truncated[i]:
+                    window_rewards.append(episode_reward[i])
+                    window_lengths.append(episode_steps[i])
+                    window_collisions += int(info["collision"][i])
+                    window_goals += int(info["goal_reached"][i])
+                    observation, _ = episode_reset(
+                        env, args.random_reset_margin, args.random_reset_max_speed
+                    )
+                    observations[i] = observation
+                    episode_reward[i] = 0.0
+                    episode_steps[i] = 0
+                else:
+                    observations[i] = next_states[i]
+
+            replay_buffer.add_batch(
+                states,
+                actions,
+                next_states,
+                rewards,
+                dones,
+            )
+            env_steps_done += args.num_envs
+
+            # One update per collected transition, back-to-back so the GPU can
+            # overlap kernel execution with launch overhead.
+            if replay_buffer.size >= args.batch_size:
+                for _ in range(args.num_envs):
+                    policy.train(replay_buffer, batch_size=args.batch_size)
+
+            if next_log is not None and env_steps_done >= next_log:
+                next_log += args.log_freq
+                elapsed = time.perf_counter() - start_time
+                message = (
+                    f"Step {env_steps_done}: replay_size={replay_buffer.size}, "
+                    f"{env_steps_done / elapsed:.0f} steps/s"
                 )
-                observations[i] = observation
-                episode_reward[i] = 0.0
-                episode_steps[i] = 0
-            else:
-                observations[i] = next_states[i]
+                if window_rewards:
+                    message += (
+                        f" | episodes={len(window_rewards)}, "
+                        f"mean_reward={np.mean(window_rewards):.3f}, "
+                        f"mean_length={np.mean(window_lengths):.1f}, "
+                        f"collision_rate={window_collisions / len(window_rewards):.1%}, "
+                        f"goal_rate={window_goals / len(window_rewards):.1%}"
+                    )
+                print(message)
+                window_rewards.clear()
+                window_lengths.clear()
+                window_collisions = 0
+                window_goals = 0
 
-        replay_buffer.add_batch(
-            states,
-            actions,
-            next_states,
-            rewards,
-            dones,
-        )
-        env_steps_done += args.num_envs
+            if next_save is not None and env_steps_done >= next_save:
+                next_save += args.save_freq
+                policy.save(model_path)
+                print(f"Step {env_steps_done}: checkpoint saved to {model_path}")
 
-        # One update per collected transition, back-to-back so the GPU can
-        # overlap kernel execution with launch overhead.
-        if replay_buffer.size >= args.batch_size:
-            for _ in range(args.num_envs):
-                policy.train(replay_buffer, batch_size=args.batch_size)
-
-        if next_log is not None and env_steps_done >= next_log:
-            next_log += args.log_freq
-            elapsed = time.perf_counter() - start_time
-            message = (
-                f"Step {env_steps_done}: replay_size={replay_buffer.size}, "
-                f"{env_steps_done / elapsed:.0f} steps/s"
-            )
-            if window_rewards:
-                message += (
-                    f" | episodes={len(window_rewards)}, "
-                    f"mean_reward={np.mean(window_rewards):.3f}, "
-                    f"mean_length={np.mean(window_lengths):.1f}, "
-                    f"collision_rate={window_collisions / len(window_rewards):.1%}, "
-                    f"goal_rate={window_goals / len(window_rewards):.1%}"
+            if next_eval is not None and env_steps_done >= next_eval:
+                next_eval += args.eval_freq
+                results = evaluate_policy(
+                    policy,
+                    args.layout_set,
+                    args.normalize_obs,
+                    episodes_per_layout=args.eval_episodes_per_layout,
+                    random_reset_margin=args.random_reset_margin,
+                    random_reset_max_speed=args.random_reset_max_speed,
                 )
-            print(message)
-            window_rewards.clear()
-            window_lengths.clear()
-            window_collisions = 0
-            window_goals = 0
-
-        if next_eval is not None and env_steps_done >= next_eval:
-            next_eval += args.eval_freq
-            results = evaluate_policy(
-                policy,
-                args.layout_set,
-                args.normalize_obs,
-                episodes_per_layout=args.eval_episodes_per_layout,
-                random_reset_margin=args.random_reset_margin,
-                random_reset_max_speed=args.random_reset_max_speed,
-            )
-            print(
-                f"Evaluation at {env_steps_done}: "
-                f"mean_reward={results['mean_reward']:.3f}, "
-                f"mean_steps={results['mean_steps']:.1f}, "
-                f"success_rate={results['success_rate']:.1%} "
-                f"(95% CI {results['success_rate_ci'][0]:.1%}-"
-                f"{results['success_rate_ci'][1]:.1%}), "
-                f"collision_rate={results['collision_rate']:.1%}"
-            )
-            policy.save(model_path)
+                print(
+                    f"Evaluation at {env_steps_done}: "
+                    f"mean_reward={results['mean_reward']:.3f}, "
+                    f"mean_steps={results['mean_steps']:.1f}, "
+                    f"success_rate={results['success_rate']:.1%} "
+                    f"(95% CI {results['success_rate_ci'][0]:.1%}-"
+                    f"{results['success_rate_ci'][1]:.1%}), "
+                    f"collision_rate={results['collision_rate']:.1%}"
+                )
+                policy.save(model_path)
+    except KeyboardInterrupt:
+        policy.save(model_path)
+        print(f"Interrupted. Checkpoint saved to: {model_path}")
+        return
 
     policy.save(model_path)
     print(f"Training complete. Model saved to: {model_path}")
@@ -296,6 +307,10 @@ def parse_args():
                         help="Maximum speed (m/s) of the sampled start velocity")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
+    parser.add_argument("--save-freq", type=int, default=5_000,
+                        help="Save a checkpoint every this many steps, "
+                             "independent of evaluation; 0 disables "
+                             "intermediate saves (default: 5000)")
     parser.add_argument("--eval-episodes-per-layout", type=int, default=20,
                         help="Episodes with sampled start/goal pairs to run "
                              "on each validation layout during evaluation")
@@ -317,6 +332,8 @@ def parse_args():
         parser.error("--random-reset-max-speed must be positive")
     if args.eval_episodes_per_layout < 1:
         parser.error("--eval-episodes-per-layout must be positive")
+    if args.save_freq < 0:
+        parser.error("--save-freq must be nonnegative")
     return args
 
 

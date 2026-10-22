@@ -47,16 +47,18 @@ All commands below run from the repository root.
 
 ## Environment
 
-A corridor of length 30 m and width 5 m with cylindrical pillars (radius 0.5 m). The agent starts at a random position and must reach a randomly placed goal.
+A fully enclosed corridor of length 30 m and width 5 m with cylindrical pillars (radius 0.5 m). The agent starts at a random position and must reach a randomly placed goal.
 
 | | |
 | --- | --- |
 | Dynamics | double integrator, `dt = 0.1 s`, speed clamped at 3.0 m/s |
-| Action | 2D acceleration command, clipped to ±2.0 m/s² |
+| Action | 2D normalized acceleration command in `[-1, 1]`, scaled by `max_acceleration = 2.0` m/s² in the environment |
 | Observation | velocity (2) + 64 lidar rays of 5.0 m range + goal-relative coordinates (2) → 68-dim |
 | Termination | wall/pillar collision, or goal reached (distance to goal `<= goal_radius = 0.5 m`) |
 | Truncation | 1000-step time limit (bootstrapped; configurable via `max_steps`) |
 | Reward | `2.5 * (d_old - d_new) - 0.1` per step (`d` = distance to the goal), +50 on reaching the goal |
+
+Actions are emitted normalized to `[-1, 1]` (the actor's `tanh` output scaled by `max_action = 1.0`) and multiplied by `max_acceleration` inside `step`/`step_batch`, so the true acceleration limit is exactly `±2.0 m/s²`. The corridor is closed at both ends; driving into either end wall terminates the episode like any other collision. Checkpoints trained before these environment changes (open goal end, double-scaled actions) are not compatible and must be retrained.
 
 The state constraint is `h(s) = vehicle_radius - min(lidar_distances)`, where `vehicle_radius = 0.2 m`; see [Constraint convention](#constraint-convention).
 

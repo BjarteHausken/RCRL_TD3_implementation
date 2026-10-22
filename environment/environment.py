@@ -46,12 +46,24 @@ class CorridorEnvironment(gym.Env):
 
         self.pillars = np.array(self.train_layouts[0], dtype=np.float32)  # Start with the first training layout
 
+        # Actions are normalized to [-1, 1]; step() scales them by
+        # max_acceleration, which is the true acceleration limit.
         self.action_space = spaces.Box(
-            low=-self.max_acceleration,
-            high=self.max_acceleration,
+            low=-1.0,
+            high=1.0,
             shape=(2,),
             dtype=np.float32,
         )
+
+        # Lidar ray directions (and the wall-intersection masks that depend
+        # only on them), computed once instead of on every cast.
+        self._ray_angles = np.linspace(
+            0, 2 * np.pi, self.num_lidar_rays, endpoint=False
+        )
+        self._ray_direction_x = np.cos(self._ray_angles)
+        self._ray_direction_y = np.sin(self._ray_angles)
+        self._ray_vertical = np.abs(self._ray_direction_y) >= 1e-6
+        self._ray_horizontal = np.abs(self._ray_direction_x) >= 1e-6
         
         max_velocity = self.dynamics.max_velocity
 
@@ -230,7 +242,8 @@ class CorridorEnvironment(gym.Env):
         # needed here.
         constraint = self._current_constraint
 
-        # Make sure action obeys acceleration limits
+        # Make sure the normalized action stays in bounds, then map it to
+        # the true acceleration range.
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
         acceleration = action * self.max_acceleration
@@ -324,6 +337,10 @@ class CorridorEnvironment(gym.Env):
         if x - self.vehicle_radius <= 0:
             return True
 
+        # Back wall at the goal end
+        if x + self.vehicle_radius >= self.length:
+            return True
+
         return False
     
     def _check_pillar_collision(self):
@@ -401,27 +418,33 @@ class CorridorEnvironment(gym.Env):
         """
         x, x_dot, y, y_dot = self.dynamics.get_state()
 
-        angles = np.linspace(0, 2 * np.pi, self.num_lidar_rays, endpoint=False)
-        direction_x = np.cos(angles)
-        direction_y = np.sin(angles)
+        direction_x = self._ray_direction_x
+        direction_y = self._ray_direction_y
 
         distances = np.full(self.num_lidar_rays, self.lidar_range, dtype=np.float64)
 
         # Top/bottom wall, matching _ray_wall_intersection's thresholds.
         t_wall = np.full(self.num_lidar_rays, np.inf, dtype=np.float64)
-        vertical = np.abs(direction_y) >= 1e-6
+        vertical = self._ray_vertical
         t_wall[vertical] = (
             np.where(direction_y[vertical] > 0, self.width / 2, -self.width / 2) - y
         ) / direction_y[vertical]
         t_wall[t_wall < 0] = np.inf
 
-        # Left wall at x = 0 (no wall at the goal end).
+        # Front wall at x = 0.
         t_left = np.full(self.num_lidar_rays, np.inf, dtype=np.float64)
-        horizontal = np.abs(direction_x) >= 1e-6
+        horizontal = self._ray_horizontal
         t_left[horizontal] = (0.0 - x) / direction_x[horizontal]
         t_left[t_left < 0] = np.inf
 
-        distances = np.minimum(distances, np.minimum(t_wall, t_left))
+        # Back wall at the goal end, x = length.
+        t_right = np.full(self.num_lidar_rays, np.inf, dtype=np.float64)
+        t_right[horizontal] = (self.length - x) / direction_x[horizontal]
+        t_right[t_right < 0] = np.inf
+
+        distances = np.minimum(
+            distances, np.minimum(t_wall, np.minimum(t_left, t_right))
+        )
 
         # Ray-circle intersections for every (ray, pillar) pair at once.
         if len(self.pillars) > 0:
@@ -483,6 +506,13 @@ class CorridorEnvironment(gym.Env):
             color="black",
         )
 
+        # Back wall at the goal end
+        ax.plot(
+            [self.length, self.length],
+            [-self.width/2, self.width/2],
+            color="black",
+        )
+
         # Pillars
         for pillar_x, pillar_y, pillar_radius in self.pillars:
             pillar = Circle(
@@ -502,10 +532,8 @@ class CorridorEnvironment(gym.Env):
 
         # Lidar
         lidar_distances = self.get_lidar()
-        
-        angles = np.linspace(0, 2 * np.pi, self.num_lidar_rays, endpoint=False)
 
-        for angle, distance in zip(angles, lidar_distances):
+        for angle, distance in zip(self._ray_angles, lidar_distances):
             end_x = x + distance * np.cos(angle)
             end_y = y + distance * np.sin(angle)
 
@@ -614,6 +642,8 @@ def step_batch(envs, actions):
     x, x_dot, y, y_dot = states.T
 
     # Double-integrator dynamics, matching DoubleIntegratorExactDiscretization.
+    # Normalized actions are clipped to the action space, then scaled by
+    # max_acceleration to the true acceleration range.
     actions = np.clip(
         actions, reference.action_space.low, reference.action_space.high
     )
@@ -636,14 +666,14 @@ def step_batch(envs, actions):
     new_x = x + 0.5 * (x_dot + new_x_dot) * dt
     new_y = y + 0.5 * (y_dot + new_y_dot) * dt
 
-    # Lidar: wall and left-wall intersections for every (env, ray) pair.
-    angles = np.linspace(0.0, 2.0 * np.pi, reference.num_lidar_rays, endpoint=False)
-    direction_x = np.cos(angles)
-    direction_y = np.sin(angles)
+    # Lidar: wall intersections for every (env, ray) pair, using the ray
+    # directions cached on the reference environment.
+    direction_x = reference._ray_direction_x
+    direction_y = reference._ray_direction_y
 
     distances = np.full((n, reference.num_lidar_rays), reference.lidar_range)
 
-    vertical = np.abs(direction_y) >= 1e-6
+    vertical = reference._ray_vertical
     t_wall = np.full((n, reference.num_lidar_rays), np.inf)
     wall_y = np.where(
         direction_y[vertical] > 0, reference.width / 2, -reference.width / 2
@@ -653,12 +683,18 @@ def step_batch(envs, actions):
     ) / direction_y[vertical][None, :]
     t_wall[t_wall < 0.0] = np.inf
 
-    horizontal = np.abs(direction_x) >= 1e-6
+    horizontal = reference._ray_horizontal
     t_left = np.full((n, reference.num_lidar_rays), np.inf)
     t_left[:, horizontal] = (0.0 - new_x[:, None]) / direction_x[horizontal][None, :]
     t_left[t_left < 0.0] = np.inf
 
-    distances = np.minimum(distances, np.minimum(t_wall, t_left))
+    t_right = np.full((n, reference.num_lidar_rays), np.inf)
+    t_right[:, horizontal] = (
+        reference.length - new_x[:, None]
+    ) / direction_x[horizontal][None, :]
+    t_right[t_right < 0.0] = np.inf
+
+    distances = np.minimum(distances, np.minimum(t_wall, np.minimum(t_left, t_right)))
 
     # Pillars are padded to a common count and masked out by ``valid``. Keep
     # their dtype so the arithmetic matches the scalar environment.
@@ -720,6 +756,7 @@ def step_batch(envs, actions):
         (new_y + reference.vehicle_radius >= reference.width / 2)
         | (new_y - reference.vehicle_radius <= -reference.width / 2)
         | (new_x - reference.vehicle_radius <= 0.0)
+        | (new_x + reference.vehicle_radius >= reference.length)
     )
     if max_pillars > 0:
         collision |= (

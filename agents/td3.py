@@ -1,4 +1,6 @@
 import copy
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -104,7 +106,8 @@ class TD3(object):
 
 	def select_action(self, state):
 		state = torch.FloatTensor(state.reshape(1, -1)).to(device)
-		return self.actor(state).cpu().data.numpy().flatten()
+		with torch.no_grad():
+			return self.actor(state).cpu().data.numpy().flatten()
 
 
 	def train(self, replay_buffer, batch_size=256):
@@ -162,11 +165,18 @@ class TD3(object):
 
 
 	def save(self, filename):
-		torch.save(self.critic.state_dict(), filename + "_critic.pth")
-		torch.save(self.critic_optimizer.state_dict(), filename + "_critic_optimizer.pth")
-		
-		torch.save(self.actor.state_dict(), filename + "_actor.pth")
-		torch.save(self.actor_optimizer.state_dict(), filename + "_actor_optimizer.pth")
+		checkpoints = {
+			"_critic.pth": self.critic.state_dict(),
+			"_critic_optimizer.pth": self.critic_optimizer.state_dict(),
+			"_actor.pth": self.actor.state_dict(),
+			"_actor_optimizer.pth": self.actor_optimizer.state_dict(),
+		}
+		# Write each artifact to a temp file, then move it into place, so a
+		# crash mid-save cannot leave a mixed (partially updated) checkpoint.
+		for suffix, state_dict in checkpoints.items():
+			tmp_path = filename + suffix + ".tmp"
+			torch.save(state_dict, tmp_path)
+			os.replace(tmp_path, filename + suffix)
 
 
 	def load(self, filename):

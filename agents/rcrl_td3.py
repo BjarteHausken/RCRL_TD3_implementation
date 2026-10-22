@@ -2,6 +2,7 @@
 
 import copy
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -299,8 +300,12 @@ class RCRLTD3:
             checkpoints["_multiplier_optimizer.pth"] = (
                 self.multiplier_optimizer.state_dict()
             )
+        # Write each artifact to a temp file, then move it into place, so a
+        # crash mid-save cannot leave a mixed (partially updated) checkpoint.
         for suffix, state_dict in checkpoints.items():
-            torch.save(state_dict, filename + suffix)
+            tmp_path = filename + suffix + ".tmp"
+            torch.save(state_dict, tmp_path)
+            os.replace(tmp_path, filename + suffix)
 
     def load(self, filename):
         self.critic.load_state_dict(torch.load(filename + "_critic.pth", map_location=device))
