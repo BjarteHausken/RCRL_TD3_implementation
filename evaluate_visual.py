@@ -8,17 +8,20 @@ from PIL import Image
 from agents.td3 import TD3
 from agents.rcrl_td3 import RCRLTD3
 from environment import create_env
-from evaluate import load_config
+from evaluate import agent_type_from_config, load_config
 
 
-def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one",
+def main(run_dir, test_layout="random", layout_set="one",
          normalize_obs=True, save_gif=None, gif_max_width=900):
     if save_gif is not None:
         # Headless capture: no interactive window, frames come from the canvas buffer.
         matplotlib.use("Agg")
 
+    config = load_config(run_dir)
+    agent_type = agent_type_from_config(config, run_dir)
+    model_path = os.path.join(run_dir, agent_type)
+
     env = create_env(layout_set, normalize_obs=normalize_obs)
-    config = load_config(MODEL_PATH)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -37,8 +40,8 @@ def main(MODEL_PATH, agent_type="td3", test_layout="random", layout_set="one",
             max_lambda=config.get("max_lambda", 100.0),
             initial_lambda=config.get("initial_lambda", 10.0),
         )
-    policy.load(MODEL_PATH)
-    print("Loaded model:", MODEL_PATH)
+    policy.load(model_path)
+    print("Loaded model:", model_path)
 
     if test_layout == "random":
         layout_idx = int(env.np_random.integers(len(env.test_layouts)))
@@ -127,13 +130,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--name",
         type=str,
-        help="Run directory under models/"
-    )
-    parser.add_argument(
-        "--agent",
-        choices=("td3", "rcrl_td3"),
-        default="td3",
-        help="Agent type and checkpoint format (default: td3)",
+        required=True,
+        help="Run directory under models/; its config.json records the agent type"
     )
     parser.add_argument(
         "--test-layout",
@@ -183,9 +181,9 @@ if __name__ == "__main__":
         except ValueError as error:
             parser.error("--test-layout must be 'random' or a zero-based integer index")
 
-    MODEL_PATH = os.path.join("models", args.name, args.agent)
+    run_dir = os.path.join("models", args.name)
 
     main(
-        MODEL_PATH, args.agent, args.test_layout, args.layout_set,
+        run_dir, args.test_layout, args.layout_set,
         args.normalize_obs, args.save_gif, args.gif_max_width,
     )

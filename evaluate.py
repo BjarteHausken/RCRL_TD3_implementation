@@ -8,19 +8,32 @@ from environment import create_env
 from evaluation import evaluate_policy
 
 
-def load_config(model_path):
-    """Read the run's ``config.json``; empty when the run has none."""
-    config_path = os.path.join(os.path.dirname(model_path), "config.json")
+def load_config(run_dir):
+    """Read a run's ``config.json``; empty when the run has none."""
+    config_path = os.path.join(run_dir, "config.json")
     if not os.path.exists(config_path):
         return {}
     with open(config_path, encoding="utf-8") as file:
         return json.load(file)
 
 
-def main(MODEL_PATH, agent_type="td3", layout_set="one", normalize_obs=True,
-         episodes_per_layout=20):
+def agent_type_from_config(config, run_dir):
+    """Return the agent type recorded in a run's ``config.json``."""
+    agent_type = config.get("agent")
+    if agent_type not in ("td3", "rcrl_td3"):
+        raise ValueError(
+            f"{os.path.join(run_dir, 'config.json')} does not record a valid "
+            f"agent type (got {agent_type!r}); expected 'td3' or 'rcrl_td3'"
+        )
+    return agent_type
+
+
+def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20):
+    config = load_config(run_dir)
+    agent_type = agent_type_from_config(config, run_dir)
+    model_path = os.path.join(run_dir, agent_type)
+
     env = create_env(layout_set, normalize_obs=normalize_obs)
-    config = load_config(MODEL_PATH)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -39,8 +52,8 @@ def main(MODEL_PATH, agent_type="td3", layout_set="one", normalize_obs=True,
             max_lambda=config.get("max_lambda", 100.0),
             initial_lambda=config.get("initial_lambda", 10.0),
         )
-    policy.load(MODEL_PATH)
-    print("Loaded model:", MODEL_PATH)
+    policy.load(model_path)
+    print("Loaded model:", model_path)
 
     # Same randomized regime and metrics as the in-training evaluation; all
     # test layouts are stepped in parallel, with several sampled start/goal
@@ -89,13 +102,7 @@ if __name__ == "__main__":
         "--name",
         type=str,
         required=True,
-        help="Run directory under models/"
-    )
-    parser.add_argument(
-        "--agent",
-        choices=("td3", "rcrl_td3"),
-        default="td3",
-        help="Agent type and checkpoint format (default: td3)",
+        help="Run directory under models/; its config.json records the agent type"
     )
     parser.add_argument(
         "--layout-set",
@@ -130,11 +137,10 @@ if __name__ == "__main__":
     if args.eval_episodes_per_layout < 1:
         parser.error("--eval-episodes-per-layout must be positive")
 
-    MODEL_PATH = os.path.join("models", args.name, args.agent)
+    run_dir = os.path.join("models", args.name)
 
     main(
-        MODEL_PATH,
-        args.agent,
+        run_dir,
         args.layout_set,
         args.normalize_obs,
         args.eval_episodes_per_layout,

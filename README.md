@@ -20,7 +20,7 @@ environment/
   layouts/generate_layouts.py  Random pillar-layout generator
   manual_control.py          Manual keyboard driving for environment sanity checks
 layouts/                     Layout sets: <set>_{train,test,validation}.npy
-models/                      Training runs (checkpoints + config.json)
+models/                      Training runs as <name>/ (checkpoints + config.json)
 utils.py                     Replay buffers (plain, and RCRL with h/h')
 train.sh                     Wrapper: ./train.sh <rcrl|rcrl-vec|td3|td3-vec> [trainer flags]
 train_scripts/
@@ -129,22 +129,22 @@ python -m train_scripts.train_rcrl_td3 --name rcrl_smoke --max-timesteps 8 \
   --output-dir /tmp/rcrl_runs
 ```
 
-Checkpoints are written under `models/<name>/` with the agent name as prefix (`rcrl_td3` or `td3`); the agent is recorded in `config.json`.
+Checkpoints are written under `models/<name>/`. The run's `config.json` records the agent type in its `agent` field (`rcrl_td3` or `td3`) alongside the checkpoint prefix.
 
 ## Evaluation
 
-Evaluate a checkpoint on all test layouts with the matching `--agent`:
+Evaluate a checkpoint on all test layouts:
 
 ```bash
-python evaluate.py --name my_rcrl_run --agent rcrl_td3
-python evaluate_visual.py --name my_rcrl_run --agent rcrl_td3
+python evaluate.py --name my_rcrl_run
+python evaluate_visual.py --name my_rcrl_run
 ```
 
 `evaluate.py` reports per-layout outcomes and the same aggregates as the in-training evaluation: mean reward, mean steps, success rate, and collision rate. Each test layout is run for `--eval-episodes-per-layout` episodes (default 20), each with a freshly sampled feasible start and goal — the same randomized regime as training. Episodes are seeded by index, so evaluation runs are reproducible, and rates are reported with 95% Wilson confidence intervals.
 
 Evaluation is batched: all episodes are stepped in parallel through `environment.step_batch`, with one actor forward pass over the stacked observations per timestep instead of one pass per episode. Finished episodes leave the batch immediately, so the loop stops as soon as every episode is done. The sampled starts, goals, and stopping rules match the sequential evaluation. Because the actor runs in a batch, floating-point accumulation differs slightly from single-row forwards, so individual episode rewards can shift marginally while the episode outcomes and step counts remain the same.
 
-For `--agent rcrl_td3`, the evaluation scripts read the run's `config.json` to reconstruct the exact agent (`--multiplier`, `--initial-lambda`, and `--max-lambda`), so a checkpoint loads against the same network structure and multiplier parameterization it was saved with. The evaluation sampling margin and speed bound are also read from the run's `config.json`.
+The evaluation scripts read the `agent` field in the run's `config.json` to select the agent type (TD3 or RCRL-TD3), so `--agent` is not needed; a run whose `config.json` does not record a valid agent type cannot be evaluated. For RCRL-TD3 the scripts also reconstruct the exact agent (`--multiplier`, `--initial-lambda`, and `--max-lambda`), so a checkpoint loads against the same network structure and multiplier parameterization it was saved with. The evaluation sampling margin and speed bound are also read from the run's `config.json`.
 
 `evaluate_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout.
 
