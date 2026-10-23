@@ -30,6 +30,7 @@ train_scripts/
   train_td3_vec.py           Vectorized TD3 trainer (parallel envs, device buffer)
 evaluate.py                  Headless evaluation over all test layouts
 evaluate_visual.py           Rendered single-episode evaluation
+evaluate_gif.py              Headless single-episode gif rendering
 evaluation.py                Batched evaluation used by trainers and evaluate.py
 test.py                      Environment checks (gymnasium check_env, margins)
 ```
@@ -149,6 +150,14 @@ Evaluation is batched: all episodes are stepped in parallel through `environment
 The evaluation scripts read the `agent` field in the run's `config.json` to select the agent type (TD3 or RCRL-TD3), so `--agent` is not needed; a run whose `config.json` does not record a valid agent type cannot be evaluated. For RCRL-TD3 the scripts also reconstruct the exact agent (`--multiplier`, `--initial-lambda`, and `--max-lambda`), so a checkpoint loads against the same network structure and multiplier parameterization it was saved with. The evaluation sampling margin and speed bound are also read from the run's `config.json`.
 
 `evaluate_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout.
+
+`evaluate_gif.py` renders one episode headlessly and writes only a gif, with no window and no evaluation report:
+
+```bash
+python evaluate_gif.py --name my_rcrl_run --test-layout 3
+```
+
+The default output is `gifs/<name>_<layout-set>_layout<INDEX>.gif`; use `--output PATH` to choose another path and `--gif-max-width` to bound the frame size. The episode is seeded by layout index, so the same model and layout always reproduce the same start, goal, and animation.
 
 ## Manual control and tests
 

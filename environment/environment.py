@@ -472,7 +472,7 @@ class CorridorEnvironment(gym.Env):
 
         return distances
 
-    def render(self):
+    def render(self, status=None):
 
         if self.fig is None:
             self.fig, self.ax = plt.subplots(figsize=(12, 4))
@@ -572,7 +572,13 @@ class CorridorEnvironment(gym.Env):
         # Information
         speed = np.sqrt(x_dot**2 + y_dot**2)
 
-        ax.set_title(f"Corridor Environment | Position: ({x:.2f}, {y:.2f}) | Speed: {speed:.2f} m/s | Step: {self.current_step}/{self.max_steps}")
+        title = (
+            f"Corridor Environment | Position: ({x:.2f}, {y:.2f}) | "
+            f"Speed: {speed:.2f} m/s | Step: {self.current_step}/{self.max_steps}"
+        )
+        if status:
+            title = f"{title}\n{status}"
+        ax.set_title(title)
 
         # Plot settings
         ax.set_xlim(-0.5, self.length + 0.5)

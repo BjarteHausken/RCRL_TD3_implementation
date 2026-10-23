@@ -5,17 +5,20 @@ import os
 import matplotlib
 from PIL import Image
 
-from agents.td3 import TD3
-from agents.rcrl_td3 import RCRLTD3
-from environment import create_env
-from evaluate import agent_type_from_config, load_config
-
 
 def main(run_dir, test_layout="random", layout_set="one",
          normalize_obs=True, save_gif=None, gif_max_width=900):
     if save_gif is not None:
-        # Headless capture: no interactive window, frames come from the canvas buffer.
+        # Headless capture: no interactive window, frames come from the canvas
+        # buffer. This must happen before importing environment (which imports
+        # matplotlib.pyplot): once pyplot has selected a GUI backend, switching
+        # to Agg can be too late and the window still opens.
         matplotlib.use("Agg")
+
+    from agents.td3 import TD3
+    from agents.rcrl_td3 import RCRLTD3
+    from environment import create_env
+    from evaluate import agent_type_from_config, load_config
 
     config = load_config(run_dir)
     agent_type = agent_type_from_config(config, run_dir)
@@ -82,8 +85,14 @@ def main(run_dir, test_layout="random", layout_set="one",
         step_count += 1
 
         state = next_state
-        # Render current state
-        env.render()
+        # Render current state, annotated with the episode's running outcome.
+        env.render(
+            status=(
+                f"Layout {layout_idx} | Reward: {episode_reward:.2f} | "
+                f"Collision: {'yes' if info['collision'] else 'no'} | "
+                f"Goal: {'yes' if info['goal_reached'] else 'no'}"
+            )
+        )
 
         if save_gif is not None:
             env.fig.canvas.draw()
