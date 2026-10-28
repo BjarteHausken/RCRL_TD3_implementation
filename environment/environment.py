@@ -26,6 +26,10 @@ class CorridorEnvironment(gym.Env):
 
         self.dynamics= dynamics
         self.length = length
+        # Width of the layout currently loaded; layouts carry their own width
+        # and ``_apply_layout`` overwrites this on every reset. Legacy layouts
+        # without a stored width fall back to the constructor value.
+        self.default_width = width
         self.width = width
         self.vehicle_radius = vehicle_radius
         self.lidar_range = lidar_range
@@ -40,11 +44,21 @@ class CorridorEnvironment(gym.Env):
         # every step so ``step`` needs only one lidar cast per transition.
         self._current_constraint = None
 
-        self.train_layouts = np.load(f"layouts/{layout_set}_train.npy")
-        self.test_layouts = np.load(f"layouts/{layout_set}_test.npy")
-        self.val_layouts = np.load(f"layouts/{layout_set}_validation.npy")
+        # Layout sets generated with per-layout widths and pillar counts are
+        # ragged object arrays, so unpickling is required; plain float arrays
+        # (legacy sets) load the same way.
+        self.train_layouts = np.load(
+            f"layouts/{layout_set}_train.npy", allow_pickle=True
+        )
+        self.test_layouts = np.load(
+            f"layouts/{layout_set}_test.npy", allow_pickle=True
+        )
+        self.val_layouts = np.load(
+            f"layouts/{layout_set}_validation.npy", allow_pickle=True
+        )
 
-        self.pillars = np.array(self.train_layouts[0], dtype=np.float32)  # Start with the first training layout
+        # Start with the first training layout.
+        self.pillars = np.zeros((0, 3), dtype=np.float32)
 
         # Actions are normalized to [-1, 1]; step() scales them by
         # max_acceleration, which is the true acceleration limit.
@@ -64,7 +78,35 @@ class CorridorEnvironment(gym.Env):
         self._ray_direction_y = np.sin(self._ray_angles)
         self._ray_vertical = np.abs(self._ray_direction_y) >= 1e-6
         self._ray_horizontal = np.abs(self._ray_direction_x) >= 1e-6
-        
+
+        # Adopt the first training layout, which also sets the width and the
+        # observation scaling that depend on it.
+        self._apply_layout(self.train_layouts[0])
+
+        # Figure
+        self.fig = None
+        self.ax = None
+
+    def _apply_layout(self, layout):
+        """Adopt a layout's corridor width and pillars.
+
+        Layouts produced by ``environment.layouts.generate_layouts`` are
+        dicts holding the layout's ``width`` and ``pillars``; plain
+        ``(num_pillars, 3)`` arrays are legacy layouts that use the width
+        passed to the constructor. Width and pillars are updated together so
+        start and goal sampling, collision checks, lidar, and observation
+        scaling all see the geometry of the layout the episode runs on.
+        """
+        if isinstance(layout, dict):
+            self.width = float(layout["width"])
+            self.pillars = np.array(layout["pillars"], dtype=np.float32)
+        else:
+            self.width = self.default_width
+            self.pillars = np.array(layout, dtype=np.float32)
+        self._update_observation_scale()
+
+    def _update_observation_scale(self):
+        """Set the observation scaling and bounds for the current width."""
         max_velocity = self.dynamics.max_velocity
 
         # [x_dot, y_dot, lidar distances, goal_x - x, goal_y - y]
@@ -88,16 +130,12 @@ class CorridorEnvironment(gym.Env):
         # distances by the lidar range, positions by the corridor extents,
         # so every observation component lands in roughly [-1, 1] / [0, 1].
         self.obs_scale = obs_scale
-        if normalize_obs:
+        if self.normalize_obs:
             obs_low = obs_low / obs_scale
             obs_high = obs_high / obs_scale
         self.observation_space = spaces.Box(
             low=obs_low, high=obs_high, dtype=np.float32
         )
-        
-        # Figure
-        self.fig = None
-        self.ax = None
 
     def reset(self, *, layout_type="fixed", seed=None, options=None, state=None,
               layout_index=None, goal=None, sample_start=False,
@@ -136,7 +174,9 @@ class CorridorEnvironment(gym.Env):
         if layout_type in layouts:
             if layout_index is None:
                 layout_index = self.np_random.integers(len(layouts[layout_type]))
-            self.pillars = layouts[layout_type][layout_index].copy()
+            # Loading the layout also updates the width, so the start and
+            # goal sampled below use the same geometry as the episode.
+            self._apply_layout(layouts[layout_type][layout_index])
 
         if state is None and sample_start:
             state = self.sample_random_state(
@@ -199,9 +239,11 @@ class CorridorEnvironment(gym.Env):
         so the sampled state is feasible with a safety buffer. The velocity is
         drawn uniformly from a disk of radius ``max_speed``.
 
-        Used to reset the agent at a random position (e.g. to cover more of
-        the feasible set during training). Call ``reset(state=...)`` with the
-        returned state.
+        Sampling uses the currently loaded layout's width and pillars, so a
+        start and goal sampled after ``reset`` selects a layout are both
+        feasible for that same geometry. Used to reset the agent at a random
+        position (e.g. to cover more of the feasible set during training).
+        Call ``reset(state=...)`` with the returned state.
         """
         if getattr(self, "np_random", None) is None:
             self.np_random = np.random.default_rng()
@@ -210,7 +252,7 @@ class CorridorEnvironment(gym.Env):
         wall_margin = self.vehicle_radius + margin
 
         for _ in range(max_attempts):
-            x = self.np_random.uniform(wall_margin, self.length - margin)
+            x = self.np_random.uniform(wall_margin, self.length - wall_margin)
             y = self.np_random.uniform(-half_width + wall_margin, half_width - wall_margin)
 
             pillar_clear = all(
@@ -472,6 +514,76 @@ class CorridorEnvironment(gym.Env):
 
         return distances
 
+    def lidar_at(self, positions):
+        """Cast every lidar ray from arbitrary positions on the current layout.
+
+        Batched equivalent of ``get_lidar`` for a set of sensor positions,
+        using the current pillars, walls, and range. ``positions`` is an
+        ``(N, 2)`` array of ``(x, y)`` centers; the return value is an
+        ``(N, num_lidar_rays)`` array of distances capped at ``lidar_range``.
+        The environment's own state is not modified.
+        """
+        positions = np.asarray(positions, dtype=np.float64).reshape(-1, 2)
+        x = positions[:, 0]
+        y = positions[:, 1]
+        n = positions.shape[0]
+        num_rays = self.num_lidar_rays
+
+        direction_x = self._ray_direction_x
+        direction_y = self._ray_direction_y
+
+        distances = np.full((n, num_rays), self.lidar_range, dtype=np.float64)
+
+        # Top/bottom wall, matching _ray_wall_intersection's thresholds.
+        vertical = self._ray_vertical
+        t_wall = np.full((n, num_rays), np.inf, dtype=np.float64)
+        wall_y = np.where(direction_y[vertical] > 0, self.width / 2, -self.width / 2)
+        t_wall[:, vertical] = (
+            wall_y[None, :] - y[:, None]
+        ) / direction_y[vertical][None, :]
+        t_wall[t_wall < 0] = np.inf
+
+        # Front wall at x = 0 and back wall at x = length.
+        horizontal = self._ray_horizontal
+        t_left = np.full((n, num_rays), np.inf, dtype=np.float64)
+        t_left[:, horizontal] = (0.0 - x[:, None]) / direction_x[horizontal][None, :]
+        t_left[t_left < 0] = np.inf
+
+        t_right = np.full((n, num_rays), np.inf, dtype=np.float64)
+        t_right[:, horizontal] = (
+            self.length - x[:, None]
+        ) / direction_x[horizontal][None, :]
+        t_right[t_right < 0] = np.inf
+
+        distances = np.minimum(
+            distances, np.minimum(t_wall, np.minimum(t_left, t_right))
+        )
+
+        # Ray-circle intersections for every (position, ray, pillar) triple.
+        if len(self.pillars) > 0:
+            pillar_x, pillar_y, pillar_radius = self.pillars.T
+            offset_x = x[:, None] - pillar_x[None, :]
+            offset_y = y[:, None] - pillar_y[None, :]
+
+            b = 2.0 * (
+                direction_x[None, :, None] * offset_x[:, None, :]
+                + direction_y[None, :, None] * offset_y[:, None, :]
+            )
+            c = offset_x**2 + offset_y**2 - pillar_radius**2
+            discriminant = b**2 - 4.0 * c[:, None, :]
+
+            sqrt_discriminant = np.sqrt(
+                np.where(discriminant >= 0.0, discriminant, 0.0)
+            )
+            t1 = (-b - sqrt_discriminant) / 2.0
+            t2 = (-b + sqrt_discriminant) / 2.0
+            t1 = np.where((discriminant >= 0.0) & (t1 >= 0.0), t1, np.inf)
+            t2 = np.where((discriminant >= 0.0) & (t2 >= 0.0), t2, np.inf)
+            pillar_distance = np.minimum(t1, t2).min(axis=2)
+            distances = np.minimum(distances, pillar_distance)
+
+        return distances
+
     def render(self, status=None):
 
         if self.fig is None:
@@ -597,10 +709,13 @@ class CorridorEnvironment(gym.Env):
 
 
 def _step_signature(env):
-    """Parameters that must match for environments to share a batched step."""
+    """Parameters that must match for environments to share a batched step.
+
+    Width is intentionally excluded: layouts carry their own width, so the
+    environments in a batch may differ in width (and in pillar count).
+    """
     return (
         env.length,
-        env.width,
         env.vehicle_radius,
         env.lidar_range,
         env.num_lidar_rays,
@@ -618,9 +733,10 @@ def step_batch(envs, actions):
     Equivalent to calling ``CorridorEnvironment.step`` on every environment
     with the matching row of ``actions``, but dynamics, collision, lidar, and
     observation math run once over arrays of shape ``(len(envs), ...)``
-    instead of in a Python loop. All environments must share the geometry,
-    dynamics, and observation parameters (they normally come from the same
-    ``create_env`` call); each may use a different layout, goal, and state.
+    instead of in a Python loop. All environments must share the corridor
+    length, dynamics, and observation parameters (they normally come from the
+    same ``create_env`` call); each may use a different layout, width, goal,
+    and state.
 
     Like the scalar environment, only one lidar cast is made per step: it
     supplies both the observation and ``next_constraint``, while
@@ -645,6 +761,7 @@ def step_batch(envs, actions):
     # the scalar environment's precision.
     states = np.array([env.dynamics.get_state() for env in envs])
     goals = np.array([env.goal for env in envs], dtype=np.float64)
+    widths = np.array([env.width for env in envs], dtype=np.float64)
     x, x_dot, y, y_dot = states.T
 
     # Double-integrator dynamics, matching DoubleIntegratorExactDiscretization.
@@ -682,10 +799,12 @@ def step_batch(envs, actions):
     vertical = reference._ray_vertical
     t_wall = np.full((n, reference.num_lidar_rays), np.inf)
     wall_y = np.where(
-        direction_y[vertical] > 0, reference.width / 2, -reference.width / 2
+        direction_y[vertical][None, :] > 0,
+        widths[:, None] / 2.0,
+        -widths[:, None] / 2.0,
     )
     t_wall[:, vertical] = (
-        wall_y[None, :] - new_y[:, None]
+        wall_y - new_y[:, None]
     ) / direction_y[vertical][None, :]
     t_wall[t_wall < 0.0] = np.inf
 
@@ -752,15 +871,18 @@ def step_batch(envs, actions):
         axis=1,
     )
     if reference.normalize_obs:
-        observations = observations / reference.obs_scale
+        # The width-dependent part of the scale differs per environment.
+        observations = observations / np.stack(
+            [env.obs_scale for env in envs]
+        )
 
     old_goal_distance = np.hypot(x - goals[:, 0], y - goals[:, 1])
     new_goal_distance = np.hypot(new_x - goals[:, 0], new_y - goals[:, 1])
     goal_reached = new_goal_distance <= reference.goal_radius
 
     collision = (
-        (new_y + reference.vehicle_radius >= reference.width / 2)
-        | (new_y - reference.vehicle_radius <= -reference.width / 2)
+        (new_y + reference.vehicle_radius >= widths / 2.0)
+        | (new_y - reference.vehicle_radius <= -widths / 2.0)
         | (new_x - reference.vehicle_radius <= 0.0)
         | (new_x + reference.vehicle_radius >= reference.length)
     )

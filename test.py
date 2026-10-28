@@ -123,6 +123,18 @@ def test_lidar(env):
     print(lidar.min())
     print(lidar.max())
 
+def test_lidar_at(env):
+    # The batched lidar helper used for off-trajectory value queries must
+    # reproduce get_lidar exactly, on the current layout.
+    env.reset(layout_type="train", layout_index=0,
+              state=[5.0, 0.0, 0.0, 0.0], goal=[20.0, 0.0])
+    positions = [(1.0, 0.0), (5.0, 1.0), (14.5, -2.0), (28.0, 0.5)]
+    batched = env.lidar_at(np.array(positions))
+    for position, distances in zip(positions, batched):
+        env.dynamics.state = np.array([position[0], 0.0, position[1], 0.0])
+        np.testing.assert_allclose(distances, env.get_lidar(), atol=1e-12)
+    print("PASS: lidar_at matches get_lidar")
+
 def test_gymnasium_env(env):
     check_env(env, warn=True)
     print("Gymnasium environment check passes")
@@ -337,6 +349,98 @@ def test_randomized_reset(env):
 
     print("PASS: randomized reset start and goal respect margins")
 
+def test_variable_layouts():
+    # Generated layouts carry their own width and pillar count. reset() must
+    # adopt both before sampling the start and goal, so both are feasible for
+    # the geometry the episode runs on, and step_batch must use each
+    # environment's own width.
+    from environment.layouts.generate_layouts import (
+        MAX_CORRIDOR_WIDTH,
+        MAX_PILLARS,
+        MAX_RADIUS,
+        MIN_CORRIDOR_WIDTH,
+        MIN_PILLARS,
+        MIN_RADIUS,
+        generate_dataset,
+    )
+
+    layouts = generate_dataset(seed=0, num_layouts=20)
+    counts = [len(layout["pillars"]) for layout in layouts]
+    widths = [layout["width"] for layout in layouts]
+    radii = [pillar[2] for layout in layouts for pillar in layout["pillars"]]
+    assert all(MIN_PILLARS <= count <= MAX_PILLARS for count in counts), counts
+    assert all(
+        MIN_CORRIDOR_WIDTH <= width <= MAX_CORRIDOR_WIDTH for width in widths
+    ), widths
+    assert all(MIN_RADIUS <= radius <= MAX_RADIUS for radius in radii), radii
+
+    layout_env = create_env("one")
+    layout_env.train_layouts = layouts
+    margin = 0.3
+    for index, layout in enumerate(layouts):
+        layout_env.reset(
+            layout_type="train",
+            layout_index=index,
+            sample_start=True,
+            start_margin=margin,
+            start_max_speed=1.0,
+            goal_margin=margin,
+            min_start_goal_distance=2 * layout_env.goal_radius,
+        )
+        assert layout_env.width == layout["width"]
+        np.testing.assert_allclose(layout_env.pillars, layout["pillars"])
+        x, x_dot, y, y_dot = layout_env.dynamics.get_state()
+        assert not layout_env.check_collision(), (index, x, y)
+        assert layout_env.width / 2 - abs(y) - layout_env.vehicle_radius >= (
+            margin - 1e-6
+        )
+        goal_x, goal_y = layout_env.goal
+        assert layout_env.width / 2 - abs(goal_y) - layout_env.vehicle_radius >= (
+            margin - 1e-6
+        )
+        for pillar_x, pillar_y, pillar_radius in layout_env.pillars:
+            clearance = pillar_radius + layout_env.vehicle_radius + margin
+            assert np.hypot(x - pillar_x, y - pillar_y) >= clearance - 1e-6
+            assert np.hypot(goal_x - pillar_x, goal_y - pillar_y) >= (
+                clearance - 1e-6
+            )
+    print("PASS: variable-width layouts sample compatible starts and goals")
+
+    # Two environments with different widths in one batched step must match
+    # their scalar step() results.
+    assert layouts[0]["width"] != layouts[1]["width"]
+    actions = np.array([[0.5, -0.25], [-0.4, 0.3]], dtype=np.float32)
+    batch_envs = []
+    scalar_results = []
+    for index, action in zip((0, 1), actions):
+        batch_env, scalar_env = create_env("one"), create_env("one")
+        for env in (batch_env, scalar_env):
+            env.train_layouts = layouts
+            env.reset(
+                layout_type="train",
+                layout_index=index,
+                state=[5.0, 0.0, 0.0, 0.0],
+                goal=[20.0, 0.0],
+            )
+        batch_envs.append(batch_env)
+        scalar_results.append(scalar_env.step(action))
+
+    observations, rewards, terminated, truncated, info = step_batch(
+        batch_envs, actions
+    )
+    for index, scalar in enumerate(scalar_results):
+        scalar_obs, scalar_reward, scalar_term, scalar_trunc, scalar_info = scalar
+        np.testing.assert_allclose(observations[index], scalar_obs, atol=1e-6)
+        np.testing.assert_allclose(rewards[index], scalar_reward, atol=1e-6)
+        assert bool(terminated[index]) == bool(scalar_term)
+        assert bool(truncated[index]) == bool(scalar_trunc)
+        np.testing.assert_allclose(
+            info["next_constraint"][index],
+            scalar_info["next_constraint"],
+            atol=1e-6,
+        )
+    print("PASS: step_batch matches step across differing widths")
+
 def test_back_wall(env):
     # The corridor is closed at the goal end: touching or crossing
     # x = length - vehicle_radius collides, and lidar sees the wall.
@@ -363,9 +467,11 @@ def test_back_wall(env):
 #test_render(env)
 test_collisions(env)
 test_lidar(env)
+test_lidar_at(env)
 test_gymnasium_env(env)
 test_random_state_sampling(env)
 test_randomized_reset(env)
+test_variable_layouts()
 test_goal(env)
 test_batch_matches_single()
 test_back_wall(env)

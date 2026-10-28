@@ -31,6 +31,7 @@ train_scripts/
 evaluate.py                  Headless evaluation over all test layouts
 evaluate_visual.py           Rendered single-episode evaluation
 evaluate_gif.py              Headless single-episode gif rendering
+evaluate_value.py            Interactive reachability-value explorer (RCRL-TD3)
 evaluation.py                Batched evaluation used by trainers and evaluate.py
 test.py                      Environment checks (gymnasium check_env, margins)
 ```
@@ -48,7 +49,7 @@ All commands below run from the repository root.
 
 ## Environment
 
-A fully enclosed corridor of length 30 m and width 5 m with cylindrical pillars (radius 0.5 m). The agent starts at a random position and must reach a randomly placed goal.
+A fully enclosed corridor of length 30 m with cylindrical pillars (radius 0.3–0.7 m); each layout has its own width (4–8 m) and pillar count (3–12). The agent starts at a random position and must reach a randomly placed goal.
 
 | | |
 | --- | --- |
@@ -65,15 +66,17 @@ The state constraint is `h(s) = vehicle_radius - min(lidar_distances)`, where `v
 
 The goal is a point inside the corridor (see [Randomized episodes](#randomized-episodes)); the agent perceives it only through the two relative goal coordinates `(goal_x - x, goal_y - y)`, which are the last two components of the observation.
 
-**Observation normalization (on by default).** Each observation component is divided by its known range: velocities by the 3.0 m/s speed limit, lidar distances by the 5.0 m range, and the goal-relative coordinates by the corridor dimensions (30 m / 5 m). Every component then lands in roughly `[-1, 1]` or `[0, 1]`. The scaling is fixed — no learned or running statistics — so training, evaluation, and manual control always see the same input, and the observation space bounds reflect it. Disable it with `--no-normalize-obs` in any trainer or evaluation script; the choice is recorded in `config.json`, and a checkpoint must be evaluated with the same setting it was trained with.
+**Observation normalization (on by default).** Each observation component is divided by its known range: velocities by the 3.0 m/s speed limit, lidar distances by the 5.0 m range, and the goal-relative coordinates by the loaded layout's corridor dimensions (30 m length and its own 4–8 m width). Every component then lands in roughly `[-1, 1]` or `[0, 1]`. The scaling is fixed — no learned or running statistics — so training, evaluation, and manual control always see the same input, and the observation space bounds reflect it. Disable it with `--no-normalize-obs` in any trainer or evaluation script; the choice is recorded in `config.json`, and a checkpoint must be evaluated with the same setting it was trained with.
 
 ## Layouts
 
-Pillar layouts live in `layouts/` as `<set>_{train,test,validation}.npy`, each an array of `(x, y, radius)` pillars per layout (the default `one` set has 30 train, 10 test, and 10 validation layouts). Generate a new set with:
+Pillar layouts live in `layouts/` as `<set>_{train,test,validation}.npy` (the default `one` set has 30 train, 10 test, and 10 validation layouts). Each layout stores its own corridor `width` and its `(x, y, radius)` pillars; new sets draw a width from 4–8 m, 3–12 pillars per layout, and a radius from 0.3–0.7 m per pillar. Generate a new set with:
 
 ```bash
-python environment/layouts/generate_layouts.py --name myset --num-pillars 6
+python -m environment.layouts.generate_layouts --name myset
 ```
+
+Use `--min-pillars`/`--max-pillars`, `--min-width`/`--max-width`, and `--min-radius`/`--max-radius` to change the ranges. When a layout is loaded, `CorridorEnvironment` adopts its width, and the randomized start and goal are sampled on that same geometry.
 
 All training and evaluation scripts select the set with `--layout-set` (default `one`); the set name is recorded in each run's `config.json`, so a checkpoint should be evaluated with the same `--layout-set` it was trained on.
 
@@ -158,6 +161,26 @@ python evaluate_gif.py --name my_rcrl_run --test-layout 3
 ```
 
 The default output is `gifs/<name>_<layout-set>_layout<INDEX>.gif`; use `--output PATH` to choose another path and `--gif-max-width` to bound the frame size. The episode is seeded by layout index, so the same model and layout always reproduce the same start, goal, and animation.
+
+### Reachability-value explorer
+
+`evaluate_value.py` plots the learned RCRL reachability value for a policy on the corridor, at a chosen velocity:
+
+```text
+V_h(s) = Q_h(s, pi(s))
+```
+
+where `Q_h` is the online safety critic and `pi` is the deterministic actor. The map uses a diverging scale centered on zero: negative values (predicted safe) run blue, positive values (predicted unsafe) run red, zero is neutral gray, and cells whose vehicle footprint overlaps a wall or pillar are left blank. The observation at every map cell is built exactly as `CorridorEnvironment._get_observation` builds it, including the lidar cast at that cell and the observation normalization recorded in the checkpoint.
+
+```bash
+python evaluate_value.py --name my_rcrl_run
+python evaluate_value.py --name my_rcrl_run --layout-index 3 --speed 1.5 --heading 45
+python evaluate_value.py --name my_rcrl_run --save value.png
+```
+
+The speed and heading sliders choose the velocity slice: every position on the map is evaluated at that same velocity. The goal sliders move the goal, and the layout slider switches pillar sets (`--layout-type train|test|val`, default `test`). Left-clicking the map pins a state marker, whose value, policy action, and raw constraint `h(s)` are shown in the upper-left corner; hovering reads the value under the cursor. The color scale rescales to each slice unless `--vmax` fixes a symmetric range. `--save` renders one headless figure instead of opening a window.
+
+The script requires a checkpoint whose `config.json` records `"agent": "rcrl_td3"`; plain TD3 runs have no safety critic. A blue or red cell is a prediction of the learned critic, not a runtime safety guarantee (see [Important limits](#important-limits)).
 
 ## Manual control and tests
 
