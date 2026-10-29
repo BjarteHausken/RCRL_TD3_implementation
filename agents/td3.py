@@ -11,6 +11,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Implementation of Twin Delayed Deep Deterministic Policy Gradients (TD3)
 # Paper: https://arxiv.org/abs/1802.09477
+# Adapted from Scott Fujimoto's reference implementation
+# (https://github.com/sfujim/TD3), MIT License.
 
 
 class Actor(nn.Module):

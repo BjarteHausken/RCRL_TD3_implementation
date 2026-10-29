@@ -108,7 +108,7 @@ class RCRLTD3:
         max_action,
         discount=0.99,
         tau=0.005,
-        policy_noise=0.1, #0.2, Marvin said decrease it
+        policy_noise=0.1,  # 0.2 was less stable in training
         noise_clip=0.5,
         policy_freq=2,
         critic_lr=1e-4,

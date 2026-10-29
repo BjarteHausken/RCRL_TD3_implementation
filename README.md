@@ -38,11 +38,17 @@ test.py                      Environment checks (gymnasium check_env, margins)
 
 ## Requirements
 
-Python with NumPy, PyTorch, Gymnasium, and Matplotlib. There is no checked-in lockfile. From the repository root:
+Python with NumPy, PyTorch, Gymnasium, Matplotlib, and Pillow. There is no checked-in lockfile, but `requirements.txt` lists the dependencies; Matplotlib is imported by `environment.py` even for headless runs. From the repository root:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install numpy torch gymnasium matplotlib
+pip install -r requirements.txt
+```
+
+Layout data is not tracked. Before training, evaluating, or running `test.py`, generate the default layout set:
+
+```bash
+python -m environment.layouts.generate_layouts --name one
 ```
 
 All commands below run from the repository root.
@@ -70,11 +76,13 @@ The goal is a point inside the corridor (see [Randomized episodes](#randomized-e
 
 ## Layouts
 
-Pillar layouts live in `layouts/` as `<set>_{train,test,validation}.npy` (the default `one` set has 30 train, 10 test, and 10 validation layouts). Each layout stores its own corridor `width` and its `(x, y, radius)` pillars; new sets draw a width from 4–8 m, 3–12 pillars per layout, and a radius from 0.3–0.7 m per pillar. Generate a new set with:
+Pillar layouts are generated rather than tracked: they live in the gitignored `layouts/` directory as `<set>_{train,test,validation}.npy`. The default `one` set has 30 train, 10 test, and 10 validation layouts; create it before running any script:
 
 ```bash
-python -m environment.layouts.generate_layouts --name myset
+python -m environment.layouts.generate_layouts --name one
 ```
+
+Generation uses the current randomized generator, so a freshly generated set is not byte-identical to the layouts used for earlier training runs. Generate a differently named set with `--name myset`. Each layout stores its own corridor `width` and its `(x, y, radius)` pillars; new sets draw a width from 4–8 m, 3–12 pillars per layout, and a radius from 0.3–0.7 m per pillar.
 
 Use `--min-pillars`/`--max-pillars`, `--min-width`/`--max-width`, and `--min-radius`/`--max-radius` to change the ranges. When a layout is loaded, `CorridorEnvironment` adopts its width, and the randomized start and goal are sampled on that same geometry.
 
@@ -185,7 +193,7 @@ The script requires a checkpoint whose `config.json` records `"agent": "rcrl_td3
 ## Manual control and tests
 
 ```bash
-python environment/manual_control.py   # drive manually (needs a display)
+python -m environment.manual_control   # drive manually (needs a display)
 python test.py                                   # check_env, random-state margins, goal termination/reward
 ```
 
@@ -281,13 +289,17 @@ Full RCRL training runs from step 0 — there is no separate exploration or warm
 | `--random-reset-margin` | `0.3` | extra clearance (m) beyond the collision boundary for sampled start and goal states |
 | `--random-reset-max-speed` | `1.0` | maximum speed (m/s) of the sampled start velocity |
 
-Evaluation follows the same regime: one sampled start and one sampled goal per test layout, seeded by layout index for reproducibility.
+Evaluation follows the same regime: `evaluate.py` runs `--eval-episodes-per-layout` episodes (default 20) per test layout, each with a freshly sampled start and goal and seeded by episode index. `evaluate_visual.py` and `evaluate_gif.py` render one episode per layout, seeded by layout index.
 
 ## Important limits
 
 RCRL's formal guarantees assume a deterministic Markov decision process, exact multi-time-scale updates, bounded/projection-compatible parameterizations, and an initial-state distribution that covers the largest feasible set (the randomized episode starts in [Randomized episodes](#randomized-episodes) widen this distribution). This corridor experiment uses neural networks, finite replay training, and observations made from velocity plus lidar rather than the full physical state. Treat success and collision rates as empirical evidence, not a formal persistent-safety guarantee.
 
 The actor has no runtime safety filter. It returns its learned action directly, so safety depends on the learned safety critic and the data encountered during training.
+
+## Acknowledgements
+
+The TD3 implementation in `agents/td3.py`, its training loop, and the `ReplayBuffer` in `utils.py` are adapted from Scott Fujimoto's TD3 reference implementation (https://github.com/sfujim/TD3), which is distributed under the MIT License. `agents/rcrl_td3.py` builds on that implementation; the RCRL objective and statewise multiplier follow the paper cited below.
 
 ## Reference
 

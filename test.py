@@ -8,17 +8,12 @@ dynamics = DoubleIntegratorExactDiscretization(dt=0.1, max_velocity=5.0)
 env = CorridorEnvironment(dynamics=dynamics, length=30.0, width=5.0)
 
 env.pillars = np.array([(10.0, 0.0, 0.5)])
-"""
-state = env.reset()
-print(state)
 
-for i in range(60):
-    state, collision = env.step(action=[1.0, 0.0])
-    print(state)
-    print("Collision:", collision)
-"""
 
 def test_collisions(env):
+    # The cases below assume the constructor's 5.0 m width, independent of
+    # whichever layout the environment adopted at construction.
+    env._apply_layout({"width": env.default_width, "pillars": env.pillars})
     # A reset gives render() a goal; the per-case states below then override
     # the dynamics state directly.
     env.reset(layout_type="fixed", state=[5.0, 0.0, 0.0, 0.0], goal=[15.0, 0.0])
