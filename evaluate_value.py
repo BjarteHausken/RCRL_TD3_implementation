@@ -588,7 +588,7 @@ class ValueExplorer:
         self.velocity_label.set_text("v" if speed > 1e-6 else "")
 
         lidar = self.env.lidar_at(position)
-        raw_constraint = self.env.vehicle_radius - float(np.min(lidar))
+        raw_constraint = self.env.safety_margin - float(np.min(lidar))
         value, action = evaluate_states(
             self.policy,
             observation_batch(self.env, position, velocity, self.goal),
@@ -670,7 +670,12 @@ def main(
         )
     model_path = os.path.join(run_dir, agent_type)
 
-    env = create_env(layout_set, normalize_obs=normalize_obs)
+    env = create_env(
+        layout_set,
+        normalize_obs=normalize_obs,
+        safety_margin=config.get("safety_margin", 0.35),
+        reward_scale=config.get("reward_scale", 1.0),
+    )
 
     layouts = {
         "train": env.train_layouts,
@@ -720,6 +725,7 @@ def main(
         multiplier_type=config.get("multiplier", "scalar"),
         max_lambda=config.get("max_lambda", 100.0),
         initial_lambda=config.get("initial_lambda", 10.0),
+        min_lambda=config.get("min_lambda", 0.0),
     )
     policy.load(model_path)
     policy.actor.eval()

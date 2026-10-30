@@ -72,25 +72,53 @@ class SafetyCritic(nn.Module):
 
 
 class MultiplierNetwork(nn.Module):
-    """A bounded, nonnegative statewise Lagrange multiplier lambda(s)."""
+    """A bounded, nonnegative statewise Lagrange multiplier lambda(s).
 
-    def __init__(self, state_dim, max_lambda, initial_lambda):
+    The output is ``min_lambda + (max_lambda - min_lambda) * sigmoid(...)``.
+    The cap is a hard bound of the parameterisation rather than a clamp applied
+    after the fact. A post-hoc clamp zeroes the gradient of every state at the
+    cap and freezes the dual there; a straight-through clamp keeps the gradient
+    but lets the pre-clamp value drift arbitrarily far above the cap, so the
+    dual can no longer descend within a training run. Sigmoid keeps a small
+    (for Adam, sufficient) gradient at both bounds and cannot overshoot them.
+
+    ``min_lambda`` is a floor on the learned multiplier. The dual drives
+    lambda(s) to zero wherever the safety critic predicts safe states, and on a
+    corridor whose visited states are overwhelmingly safe that collapses the
+    whole network and switches the constraint off. A positive floor keeps a
+    minimum safety pressure everywhere while leaving the statewise variation
+    above it intact. ``min_lambda = 0`` reproduces the pure dual.
+    """
+
+    def __init__(self, state_dim, max_lambda, initial_lambda, min_lambda=0.0):
         super().__init__()
         self.l1 = nn.Linear(state_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.l3 = nn.Linear(256, 1)
         self.max_lambda = max_lambda
+        self.min_lambda = min_lambda
         # Start with lambda(s) == initial_lambda for every state: the random
-        # output weights are zeroed so only the bias sets the softplus input.
-        initial_logit = math.log(math.expm1(initial_lambda))
+        # output weights are zeroed so only the bias sets the sigmoid logit.
+        initial_fraction = (initial_lambda - min_lambda) / (
+            max_lambda - min_lambda
+        )
+        initial_logit = math.log(initial_fraction / (1.0 - initial_fraction))
         nn.init.zeros_(self.l3.weight)
         nn.init.constant_(self.l3.bias, initial_logit)
 
     def forward(self, state):
         multiplier = F.relu(self.l1(state))
         multiplier = F.relu(self.l2(multiplier))
-        multiplier = F.softplus(self.l3(multiplier))
-        return multiplier.clamp(max=self.max_lambda)
+        # Evaluate the sigmoid in float64: in float32 it saturates to exactly
+        # 0 or 1 once the logit passes about +/-17, which zeroes the gradient
+        # and would reproduce the clamp freeze for a long-running dual. The
+        # result is cast back so the multiplier keeps the float32 dtype of
+        # the rest of the actor loss.
+        logit = self.l3(multiplier).double()
+        bounded = self.min_lambda + (
+            self.max_lambda - self.min_lambda
+        ) * torch.sigmoid(logit)
+        return bounded.to(torch.float32)
 
 
 class RCRLTD3:
@@ -114,11 +142,12 @@ class RCRLTD3:
         critic_lr=1e-4,
         actor_lr=2e-5,
         safety_lr=1e-4,
-        multiplier_lr=1e-6,
+        multiplier_lr=1e-5,
         multiplier_freq=6,
-        max_lambda=100.0,
-        initial_lambda=10.0,
-        multiplier_type="scalar",
+        max_lambda=2.0,
+        initial_lambda=0.1,
+        min_lambda=0.0,
+        multiplier_type="network",
         grad_clip=1.0,
     ):
         if policy_freq < 1:
@@ -127,12 +156,22 @@ class RCRLTD3:
             raise ValueError("multiplier_freq must be at least policy_freq")
         if max_lambda <= 0:
             raise ValueError("max_lambda must be positive")
-        if not 0 < initial_lambda <= max_lambda:
-            raise ValueError("initial_lambda must be in (0, max_lambda]")
-        if multiplier_type not in ("scalar", "network"):
-            raise ValueError("multiplier_type must be 'scalar' or 'network'")
+        if initial_lambda <= 0:
+            raise ValueError("initial_lambda must be positive")
+        if min_lambda < 0:
+            raise ValueError("min_lambda must be nonnegative")
         if grad_clip < 0:
             raise ValueError("grad_clip must be nonnegative")
+        if multiplier_type not in ("scalar", "network"):
+            raise ValueError("multiplier_type must be 'scalar' or 'network'")
+        # The bounds apply to the learned network; a fixed scalar may exceed
+        # max_lambda and the floor is irrelevant in that mode.
+        if multiplier_type == "network" and not (
+            min_lambda < initial_lambda < max_lambda
+        ):
+            raise ValueError(
+                "network mode requires min_lambda < initial_lambda < max_lambda"
+            )
 
         self.actor = Actor(state_dim, action_dim, max_action).to(device)
         self.actor_target = copy.deepcopy(self.actor)
@@ -148,7 +187,9 @@ class RCRLTD3:
 
         self.multiplier_type = multiplier_type
         if multiplier_type == "network":
-            self.multiplier = MultiplierNetwork(state_dim, max_lambda, initial_lambda).to(device)
+            self.multiplier = MultiplierNetwork(
+                state_dim, max_lambda, initial_lambda, min_lambda
+            ).to(device)
             self.multiplier_optimizer = torch.optim.Adam(self.multiplier.parameters(), lr=multiplier_lr)
         else:
             # A fixed Lagrange multiplier shared by all states, set by the
@@ -157,6 +198,7 @@ class RCRLTD3:
 
         self.max_action = max_action
         self.max_lambda = max_lambda
+        self.min_lambda = min_lambda
         self.discount = discount
         self.tau = tau
         self.policy_noise = policy_noise
@@ -177,6 +219,35 @@ class RCRLTD3:
         if state.dim() == 1:
             state = state.unsqueeze(0)
         return self.multiplier_for(state).mean().item()
+
+    def lambda_stats(self, state):
+        """Mean, max and cap fraction of lambda(s), for progress logging."""
+        state = torch.as_tensor(state, dtype=torch.float32, device=device)
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        with torch.no_grad():
+            values = self.multiplier_for(state)
+            stats = {
+                "mean": values.mean().item(),
+                "max": values.max().item(),
+            }
+            if self.multiplier_type == "network":
+                stats["cap_fraction"] = (
+                    values >= 0.99 * self.max_lambda
+                ).float().mean().item()
+                floor_tolerance = 0.01 * (self.max_lambda - self.min_lambda)
+                stats["floor_fraction"] = (
+                    values <= self.min_lambda + floor_tolerance
+                ).float().mean().item()
+        return stats
+
+    def policy_safety_value(self, state):
+        """Mean safety-critic prediction h(s, pi(s)) for the current policy."""
+        state = torch.as_tensor(state, dtype=torch.float32, device=device)
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        with torch.no_grad():
+            return self.safety_critic(state, self.actor(state)).mean().item()
 
     def select_action(self, state):
         state = torch.as_tensor(state.reshape(1, -1), dtype=torch.float32, device=device)

@@ -2,6 +2,8 @@ import argparse
 import json
 import os
 
+import numpy as np
+
 from agents.td3 import TD3
 from agents.rcrl_td3 import RCRLTD3
 from environment import create_env
@@ -28,12 +30,107 @@ def agent_type_from_config(config, run_dir):
     return agent_type
 
 
-def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20):
+def _json_safe(value):
+    """Convert NumPy arrays/scalars in an evaluation result to JSON types."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def save_evaluation_json(path, results, config, run_dir, layout_set,
+                         normalize_obs, safety_margin, reward_scale):
+    """Write an evaluation report, including per-episode arrays, as JSON.
+
+    The per-episode arrays use the same seeded start/goal pairs across runs,
+    so reports from different checkpoints can be joined by
+    ``(layout_indices, episode index)`` for paired comparisons.
+    """
+    payload = {
+        "format": "rcrl-eval-v1",
+        "run": os.path.basename(os.path.normpath(run_dir)),
+        "run_dir": run_dir,
+        "agent": config.get("agent"),
+        "layout_set": layout_set,
+        "layout_type": "test",
+        "normalize_obs": bool(normalize_obs),
+        "episodes_per_layout": int(results["episodes_per_layout"]),
+        "safety_margin": float(safety_margin),
+        "reward_scale": float(reward_scale),
+        "random_reset_margin": config.get("random_reset_margin", 0.3),
+        "random_reset_max_speed": config.get("random_reset_max_speed", 1.0),
+        "metrics": _json_safe({
+            key: results[key]
+            for key in (
+                "mean_reward",
+                "mean_steps",
+                "success_rate",
+                "collision_rate",
+                "success_rate_ci",
+                "collision_rate_ci",
+                "margin_violation_rate",
+                "margin_violation_rate_ci",
+                "margin_step_fraction",
+                "mean_clearance",
+                "mean_min_clearance",
+            )
+        }),
+        "per_layout": _json_safe({
+            "success_rate": results["per_layout_success_rate"],
+            "collision_rate": results["per_layout_collision_rate"],
+            "margin_violation_rate": results["per_layout_margin_violation_rate"],
+            "mean_min_clearance": results["per_layout_min_clearance"],
+        }),
+        "episodes": _json_safe({
+            "layout_indices": results["layout_indices"],
+            "rewards": results["rewards"],
+            "steps": results["steps"],
+            "successes": results["successes"],
+            "collisions": results["collisions"],
+            "margin_violations": results["margin_violations"],
+            "margin_steps": results["margin_steps"],
+            "margin_step_fraction": results["margin_step_fraction_per_episode"],
+            "mean_clearance": results["mean_clearance_per_episode"],
+            "max_h": results["max_h"],
+            "min_clearance": results["min_clearance"],
+        }),
+        "config": config,
+    }
+
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        # allow_nan=False keeps the file valid JSON; every episode takes at
+        # least one step, so the recorded arrays are finite.
+        json.dump(payload, file, indent=2, allow_nan=False)
+        file.write("\n")
+
+
+def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
+         safety_margin=None, reward_scale=None, save_json=None):
     config = load_config(run_dir)
     agent_type = agent_type_from_config(config, run_dir)
     model_path = os.path.join(run_dir, agent_type)
 
-    env = create_env(layout_set, normalize_obs=normalize_obs)
+    # The constraint margin and reward divisor are properties of the run.
+    # Checkpoints trained before these were recorded fall back to the
+    # environment default margin and unscaled rewards.
+    if safety_margin is None:
+        safety_margin = config.get("safety_margin", 0.35)
+    if reward_scale is None:
+        reward_scale = config.get("reward_scale", 1.0)
+
+    env = create_env(
+        layout_set,
+        normalize_obs=normalize_obs,
+        safety_margin=safety_margin,
+        reward_scale=reward_scale,
+    )
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -51,6 +148,7 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20):
             multiplier_type=config.get("multiplier", "scalar"),
             max_lambda=config.get("max_lambda", 100.0),
             initial_lambda=config.get("initial_lambda", 10.0),
+            min_lambda=config.get("min_lambda", 0.0),
         )
     policy.load(model_path)
     print("Loaded model:", model_path)
@@ -66,6 +164,8 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20):
         episodes_per_layout=episodes_per_layout,
         random_reset_margin=config.get("random_reset_margin", 0.3),
         random_reset_max_speed=config.get("random_reset_max_speed", 1.0),
+        safety_margin=safety_margin,
+        reward_scale=reward_scale,
     )
 
     layout_indices = results["layout_indices"]
@@ -76,13 +176,16 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20):
             f"Layout {layout_idx}: "
             f"success={results['successes'][mask].sum()}/{mask.sum()} "
             f"collision={results['collisions'][mask].sum()}/{mask.sum()} "
-            f"reward={results['rewards'][mask].mean():.1f} "
-            f"steps={results['steps'][mask].mean():.1f}"
+            f"margin_violations={results['margin_violations'][mask].sum()}/{mask.sum()} "
+            f"reward={results['rewards'][mask].mean():.2f} "
+            f"steps={results['steps'][mask].mean():.1f} "
+            f"min_clearance={results['min_clearance'][mask].mean():.3f} m"
         )
 
     num_episodes = len(results["rewards"])
     success_ci = results["success_rate_ci"]
     collision_ci = results["collision_rate_ci"]
+    margin_ci = results["margin_violation_rate_ci"]
     print()
     print(
         f"Success rate: {results['successes'].sum()}/{num_episodes} "
@@ -93,6 +196,28 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20):
         f"Collision rate: {results['collision_rate']:.1%} "
         f"(95% CI {collision_ci[0]:.1%}-{collision_ci[1]:.1%})"
     )
+    print(
+        f"Margin (h > 0) violation rate: "
+        f"{results['margin_violations'].sum()}/{num_episodes} "
+        f"({results['margin_violation_rate']:.1%}, 95% CI "
+        f"{margin_ci[0]:.1%}-{margin_ci[1]:.1%}) | "
+        f"Steps in margin: {results['margin_step_fraction']:.2%} | "
+        f"Mean min clearance: {results['mean_min_clearance']:.3f} m | "
+        f"Mean clearance: {results['mean_clearance']:.3f} m"
+    )
+
+    if save_json is not None:
+        save_evaluation_json(
+            save_json,
+            results,
+            config,
+            run_dir,
+            layout_set,
+            normalize_obs,
+            safety_margin,
+            reward_scale,
+        )
+        print(f"Saved JSON: {save_json}")
 
 
 if __name__ == "__main__":
@@ -131,11 +256,35 @@ if __name__ == "__main__":
         help="Episodes with sampled start/goal pairs to run on each test "
              "layout (default: 20)",
     )
+    parser.add_argument(
+        "--safety-margin",
+        type=float,
+        default=None,
+        help="Override the safety margin recorded in config.json for the "
+             "margin-violation metrics",
+    )
+    parser.add_argument(
+        "--reward-scale",
+        type=float,
+        default=None,
+        help="Override the reward divisor recorded in config.json",
+    )
+    parser.add_argument(
+        "--save-json",
+        metavar="PATH",
+        default=None,
+        help="Write the evaluation report, including per-episode arrays, to "
+             "PATH as JSON",
+    )
 
     args = parser.parse_args()
 
     if args.eval_episodes_per_layout < 1:
         parser.error("--eval-episodes-per-layout must be positive")
+    if args.safety_margin is not None and args.safety_margin <= 0:
+        parser.error("--safety-margin must be positive")
+    if args.reward_scale is not None and args.reward_scale <= 0:
+        parser.error("--reward-scale must be positive")
 
     run_dir = os.path.join("models", args.name)
 
@@ -144,4 +293,7 @@ if __name__ == "__main__":
         args.layout_set,
         args.normalize_obs,
         args.eval_episodes_per_layout,
+        safety_margin=args.safety_margin,
+        reward_scale=args.reward_scale,
+        save_json=args.save_json,
     )

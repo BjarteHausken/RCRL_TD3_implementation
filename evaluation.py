@@ -41,6 +41,8 @@ def evaluate_policy(
     episodes_per_layout=20,
     random_reset_margin=0.3,
     random_reset_max_speed=1.0,
+    safety_margin=0.35,
+    reward_scale=1.0,
 ):
     """Evaluate a deterministic policy on every layout of ``layout_type``.
 
@@ -50,17 +52,37 @@ def evaluate_policy(
     distribution. All episodes are stepped in parallel; once an episode
     terminates or is truncated it leaves the batch.
 
+    ``safety_margin`` defines the constraint used for the violation metrics:
+    ``h(s) = safety_margin - min(lidar)`` and ``h(s) > 0`` is a margin
+    violation. ``reward_scale`` must match the environment reward divisor used
+    for training so reported rewards are comparable.
+
     Returns the aggregate metrics ``mean_reward``, ``mean_steps``,
     ``success_rate``, ``collision_rate`` and their 95% Wilson intervals
     (``success_rate_ci``, ``collision_rate_ci``), the per-episode arrays
     ``rewards``, ``steps``, ``successes``, ``collisions`` and
     ``layout_indices``, and the per-layout means ``per_layout_success_rate``
     and ``per_layout_collision_rate``.
+
+    Margin metrics: ``margin_violation_rate`` is the fraction of episodes
+    that entered the safety margin at least once
+    (``margin_violations``), ``margin_step_fraction`` is the mean fraction of
+    an episode spent inside the margin (``margin_steps`` per episode), and
+    ``min_clearance`` / ``max_h`` record the closest approach and largest
+    constraint value per episode. ``mean_clearance`` is the mean clearance
+    over all visited states. All clearance values are distances from the
+    vehicle centre to the nearest obstacle surface; the collision boundary is
+    ``vehicle_radius``.
     """
     if episodes_per_layout < 1:
         raise ValueError("episodes_per_layout must be positive")
 
-    reference = create_env(layout_set, normalize_obs=normalize_obs)
+    reference = create_env(
+        layout_set,
+        normalize_obs=normalize_obs,
+        safety_margin=safety_margin,
+        reward_scale=reward_scale,
+    )
     layouts = (
         reference.val_layouts if layout_type == "val" else reference.test_layouts
     )
@@ -73,7 +95,12 @@ def evaluate_policy(
     )
     layout_indices = np.repeat(np.arange(num_layouts), episodes_per_layout)
     for episode_index in range(num_episodes):
-        env = create_env(layout_set, normalize_obs=normalize_obs)
+        env = create_env(
+            layout_set,
+            normalize_obs=normalize_obs,
+            safety_margin=safety_margin,
+            reward_scale=reward_scale,
+        )
         states[episode_index], _ = env.reset(
             layout_type=layout_type,
             layout_index=int(layout_indices[episode_index]),
@@ -93,6 +120,15 @@ def evaluate_policy(
     collisions = np.zeros(num_episodes, dtype=bool)
     active = np.ones(num_episodes, dtype=bool)
 
+    # Margin-violation bookkeeping. ``constraint`` in info is h(s) before the
+    # action; ``next_constraint`` is h(s') after it. The former counts time
+    # spent in the margin, while both feed the per-episode closest approach.
+    margin_steps = np.zeros(num_episodes, dtype=int)
+    max_h = np.full(num_episodes, -np.inf)
+    min_clearance = np.full(num_episodes, np.inf)
+    clearance_sum = np.zeros(num_episodes)
+    constraint_margin = reference.safety_margin
+
     while active.any():
         active_indices = np.flatnonzero(active)
         with torch.inference_mode():
@@ -109,6 +145,21 @@ def evaluate_policy(
         episode_reward[active_indices] += rewards
         episode_steps[active_indices] += 1
 
+        constraint = info["constraint"]
+        next_constraint = info["next_constraint"]
+        margin_steps[active_indices] += constraint > 0.0
+        clearance_sum[active_indices] += constraint_margin - constraint
+        max_h[active_indices] = np.maximum(
+            max_h[active_indices], np.maximum(constraint, next_constraint)
+        )
+        min_clearance[active_indices] = np.minimum(
+            min_clearance[active_indices],
+            np.minimum(
+                constraint_margin - constraint,
+                constraint_margin - next_constraint,
+            ),
+        )
+
         # Record each episode's outcome at its first terminal or truncated
         # step, then drop it from the batch.
         finished = terminated | truncated
@@ -117,6 +168,20 @@ def evaluate_policy(
         collisions[finished_indices] = info["collision"][finished]
         active[finished_indices] = False
 
+    margin_violations = max_h > 0.0
+    margin_step_fraction = np.divide(
+        margin_steps,
+        episode_steps,
+        out=np.zeros(num_episodes, dtype=float),
+        where=episode_steps > 0,
+    )
+    mean_clearance = np.divide(
+        clearance_sum,
+        episode_steps,
+        out=np.zeros(num_episodes, dtype=float),
+        where=episode_steps > 0,
+    )
+
     return {
         "mean_reward": float(episode_reward.mean()),
         "mean_steps": float(episode_steps.mean()),
@@ -124,16 +189,35 @@ def evaluate_policy(
         "collision_rate": float(collisions.mean()),
         "success_rate_ci": _wilson_interval(successes.sum(), num_episodes),
         "collision_rate_ci": _wilson_interval(collisions.sum(), num_episodes),
+        "margin_violation_rate": float(margin_violations.mean()),
+        "margin_violation_rate_ci": _wilson_interval(
+            margin_violations.sum(), num_episodes
+        ),
+        "margin_step_fraction": float(margin_step_fraction.mean()),
+        "mean_clearance": float(mean_clearance.mean()),
+        "mean_min_clearance": float(min_clearance.mean()),
         "rewards": episode_reward,
         "steps": episode_steps,
         "successes": successes,
         "collisions": collisions,
+        "margin_violations": margin_violations,
+        "margin_steps": margin_steps,
+        "margin_step_fraction_per_episode": margin_step_fraction,
+        "mean_clearance_per_episode": mean_clearance,
+        "max_h": max_h,
+        "min_clearance": min_clearance,
         "layout_indices": layout_indices,
         "episodes_per_layout": episodes_per_layout,
         "per_layout_success_rate": successes.reshape(
             num_layouts, episodes_per_layout
         ).mean(axis=1),
         "per_layout_collision_rate": collisions.reshape(
+            num_layouts, episodes_per_layout
+        ).mean(axis=1),
+        "per_layout_margin_violation_rate": margin_violations.reshape(
+            num_layouts, episodes_per_layout
+        ).mean(axis=1),
+        "per_layout_min_clearance": min_clearance.reshape(
             num_layouts, episodes_per_layout
         ).mean(axis=1),
     }

@@ -64,11 +64,13 @@ A fully enclosed corridor of length 30 m with cylindrical pillars (radius 0.3–
 | Observation | velocity (2) + 64 lidar rays of 5.0 m range + goal-relative coordinates (2) → 68-dim |
 | Termination | wall/pillar collision, or goal reached (distance to goal `<= goal_radius = 0.5 m`) |
 | Truncation | 1000-step time limit (bootstrapped; configurable via `max_steps`) |
-| Reward | `2.5 * (d_old - d_new) - 0.1` per step (`d` = distance to the goal), +50 on reaching the goal |
+| Reward | `(2.5 * (d_old - d_new) - 0.1) / reward_scale` per step (`d` = distance to the goal), `+50 / reward_scale` on reaching the goal; `reward_scale` is `1.0` by default and `50` in the trainers |
 
 Actions are emitted normalized to `[-1, 1]` (the actor's `tanh` output scaled by `max_action = 1.0`) and multiplied by `max_acceleration` inside `step`/`step_batch`, so the true acceleration limit is exactly `±2.0 m/s²`. The corridor is closed at both ends; driving into either end wall terminates the episode like any other collision. Checkpoints trained before these environment changes (open goal end, double-scaled actions) are not compatible and must be retrained.
 
-The state constraint is `h(s) = vehicle_radius - min(lidar_distances)`, where `vehicle_radius = 0.2 m`; see [Constraint convention](#constraint-convention).
+The state constraint is `h(s) = safety_margin - min(lidar_distances)`, with `safety_margin = 0.35 m` by default; see [Constraint convention](#constraint-convention). The margin decouples the constraint boundary from collision: a collision still ends the episode at `min(lidar_distances) <= vehicle_radius = 0.2 m`, while `h(s) > 0` already holds whenever the agent enters the wider safety band. Set it with `--safety-margin` (it must be at least the vehicle radius and at most the 5 m lidar range).
+
+Rewards are divided by a fixed `reward_scale` (`--reward-scale`, default `50` in the trainers and `1.0` in the environment) so that episodic returns and safety values have comparable magnitudes in the RCRL actor loss; see [Reward scaling](#reward-scaling). Both `safety_margin` and `reward_scale` are recorded in `config.json`, and evaluation uses the recorded values unless overridden.
 
 The goal is a point inside the corridor (see [Randomized episodes](#randomized-episodes)); the agent perceives it only through the two relative goal coordinates `(goal_x - x, goal_y - y)`, which are the last two components of the observation.
 
@@ -96,10 +98,10 @@ Run from the repository root as a module:
 python -m train_scripts.train_rcrl_td3 --name my_rcrl_run
 ```
 
-The default is `--multiplier scalar`, a single fixed Lagrange multiplier shared by all states and set with `--initial-lambda` (never updated during training). To use the paper's statewise `lambda(s)` network instead, pass `--multiplier network`:
+The default is `--multiplier network`, the paper's statewise `lambda(s)` trained by dual ascent. To use a single fixed Lagrange multiplier shared by all states instead, pass `--multiplier scalar`; it is set by `--initial-lambda` and never updated during training:
 
 ```bash
-python -m train_scripts.train_rcrl_td3 --name my_rcrl_network --multiplier network
+python -m train_scripts.train_rcrl_td3 --name my_rcrl_scalar --multiplier scalar
 ```
 
 The plain TD3 baseline (same randomized start+goal episode regime, same
@@ -151,14 +153,26 @@ Evaluate a checkpoint on all test layouts:
 
 ```bash
 python evaluate.py --name my_rcrl_run
+python evaluate.py --name my_rcrl_run --save-json results/my_rcrl_run.json
 python evaluate_visual.py --name my_rcrl_run
 ```
 
-`evaluate.py` reports per-layout outcomes and the same aggregates as the in-training evaluation: mean reward, mean steps, success rate, and collision rate. Each test layout is run for `--eval-episodes-per-layout` episodes (default 20), each with a freshly sampled feasible start and goal — the same randomized regime as training. Episodes are seeded by index, so evaluation runs are reproducible, and rates are reported with 95% Wilson confidence intervals.
+`--save-json PATH` writes the full report — run metadata, aggregate metrics, per-layout metrics, and the per-episode arrays — as JSON. Per-episode arrays use the same seeded start/goal pairs for every checkpoint of a layout set, so reports can be joined by layout and episode index for paired comparisons across runs. The file also embeds the run's `config.json` for provenance.
+
+`evaluate.py` reports per-layout outcomes and the same aggregates as the in-training evaluation: mean reward, mean steps, success rate, collision rate, and margin metrics. Each test layout is run for `--eval-episodes-per-layout` episodes (default 20), each with a freshly sampled feasible start and goal — the same randomized regime as training. Episodes are seeded by index, so evaluation runs are reproducible, and rates are reported with 95% Wilson confidence intervals.
+
+The margin metrics measure constraint satisfaction separately from collision, using the run's `safety_margin` and `reward_scale` from `config.json` (override with `--safety-margin` / `--reward-scale`):
+
+- **margin violation rate** — fraction of episodes in which `h(s) > 0` at any step, i.e. the agent entered the safety band at least once;
+- **steps in margin** — fraction of all steps spent with `h(s) > 0`;
+- **mean clearance** — mean over steps of `safety_margin - h(s) = min(lidar)`; higher is farther from the boundary;
+- **mean min clearance** — mean over episodes of each episode's minimum clearance, the closest approach to the boundary.
+
+Per-layout output also shows how many episodes had a margin violation and the mean minimum clearance.
 
 Evaluation is batched: all episodes are stepped in parallel through `environment.step_batch`, with one actor forward pass over the stacked observations per timestep instead of one pass per episode. Finished episodes leave the batch immediately, so the loop stops as soon as every episode is done. The sampled starts, goals, and stopping rules match the sequential evaluation. Because the actor runs in a batch, floating-point accumulation differs slightly from single-row forwards, so individual episode rewards can shift marginally while the episode outcomes and step counts remain the same.
 
-The evaluation scripts read the `agent` field in the run's `config.json` to select the agent type (TD3 or RCRL-TD3), so `--agent` is not needed; a run whose `config.json` does not record a valid agent type cannot be evaluated. For RCRL-TD3 the scripts also reconstruct the exact agent (`--multiplier`, `--initial-lambda`, and `--max-lambda`), so a checkpoint loads against the same network structure and multiplier parameterization it was saved with. The evaluation sampling margin and speed bound are also read from the run's `config.json`.
+The evaluation scripts read the `agent` field in the run's `config.json` to select the agent type (TD3 or RCRL-TD3), so `--agent` is not needed; a run whose `config.json` does not record a valid agent type cannot be evaluated. For RCRL-TD3 the scripts also reconstruct the exact agent (`--multiplier`, `--initial-lambda`, `--max-lambda`, and `--min-lambda`), so a checkpoint loads against the same network structure and multiplier parameterisation it was saved with. The evaluation sampling margin and speed bound are also read from the run's `config.json`.
 
 `evaluate_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout.
 
@@ -204,10 +218,14 @@ python test.py                                   # check_env, random-state margi
 The environment defines the state constraint as:
 
 ```text
-h(s) = vehicle_radius - min(lidar_distances)
+h(s) = safety_margin - min(lidar_distances)
 ```
 
-Therefore `h(s) <= 0` is safe and `h(s) > 0` means the sensed vehicle footprint overlaps a wall or pillar. The replay buffer stores both `h(s)` before the action and `h(s')` after it. The current-state value is essential: reachability is about the worst violation from the current state onward, not only the next collision signal.
+Therefore `h(s) <= 0` is safe and `h(s) > 0` means the agent is inside the safety margin. `safety_margin` is measured from the vehicle centre to the obstacle surface — the same quantity as `min(lidar_distances)` — so it **includes** the vehicle radius rather than being an extra buffer on top of it. The extra distance beyond the collision boundary is `safety_margin - vehicle_radius`, which is `0.15 m` at the default `safety_margin = 0.35 m`. With that default, `h(s) > 0` is a warning band: a physical collision does not occur until `min(lidar_distances) <= vehicle_radius = 0.2 m`, which ends the episode. This separation makes the constraint informative for RCRL — when the margin equals the collision radius, `h(s) > 0` coincides with termination and the constraint is inactive, because avoiding collision is already reward-optimal. Raising `--safety-margin` makes the constraint bind earlier and asks the agent to keep a larger clearance; lowering it toward `vehicle_radius` recovers the old, saturating formulation.
+
+The margin must lie between the vehicle radius (0.2 m) and the lidar range (5 m). It is a property of the environment, stored in `config.json` with each run; evaluation constructs the environment with the recorded value.
+
+The replay buffer stores both `h(s)` before the action and `h(s')` after it. The current-state value is essential: reachability is about the worst violation from the current state onward, not only the next collision signal.
 
 ## How TD3 is adjusted to RCRL
 
@@ -239,9 +257,13 @@ A predicted unsafe value is positive, so it increases the actor loss. A ReLU or 
 
 ### 3. Learn a state-dependent multiplier
 
-`MultiplierNetwork` produces `lambda(s)`, rather than one global penalty. It uses Softplus to remain nonnegative and clips its output to `--max-lambda`. The multiplier is updated by gradient ascent on `lambda(s) Q_h(s, pi(s))`, implemented as minimization of its negative with the actor and safety critic detached. Thus it grows at states predicted to be unsafe and stays bounded for infeasible states.
+`MultiplierNetwork` produces `lambda(s)`, rather than one global penalty. It outputs `min_lambda + (max_lambda - min_lambda) * sigmoid(...)`, so the bounds are built into the parameterisation instead of being applied afterwards. A plain clamp freezes the dual at the cap because it zeroes the gradient of every saturated state; a straight-through clamp keeps the gradient but lets the pre-clamp value drift arbitrarily far above the cap, which the dual cannot undo within a run. Sigmoid keeps the value inside `[min_lambda, max_lambda]` and keeps a usable gradient at both ends. The multiplier is updated by gradient ascent on `lambda(s) Q_h(s, pi(s))`, implemented as minimization of its negative with the actor and safety critic detached. Thus it grows at states predicted to be unsafe and the training log reports `mean_lambda`, `max_lambda`, `lambda_at_cap`, `lambda_at_floor`, and `mean_h_pred` so saturation is visible immediately.
 
-`--multiplier scalar` replaces the network with a single fixed Lagrange multiplier shared by all states. It is set by `--initial-lambda` and never updated during training (so `--multiplier-lr` and `--multiplier-freq` have no effect in this mode), and the value is recorded in `config.json` like any other hyperparameter.
+`--max-lambda` must be scaled with the reward divisor. At `--reward-scale 50`, the paper's unscaled bound of 100 corresponds to `2.0`, which is the default; leaving it at 100 would let the dual apply a penalty 5000× the reward scale, and the actor would avoid the goal to maximize clearance.
+
+`--min-lambda` (default `0.0`) is the floor of that range. The pure dual (`0.0`) can drive `lambda(s)` to zero: the dual only sees states that reach the replay buffer, those are overwhelmingly safe once the actor starts avoiding obstacles (a few percent of steps have `h(s) > 0`), and one shared network cannot preserve `lambda` on the rare risky states while it is pushed down by the rest. The actor then lowers its predicted `h` and the constraint switches off — evaluated policies showed `lambda` below `1e-3` and collision rates above 60%. A floor such as `0.5` keeps a minimum safety pressure everywhere while the network still adapts upward on risky states. The floor does not prevent `lambda` from being pinned at `--max-lambda` on the early collision-heavy phase, so the two bounds should be chosen with the reward scale in mind; a run whose log shows `lambda_at_floor` near 100% has no statewise adaptation left and is behaving like `--multiplier scalar`.
+
+`--multiplier scalar` replaces the network with a single fixed Lagrange multiplier shared by all states. It is set by `--initial-lambda` and never updated during training (so `--multiplier-lr` and `--multiplier-freq` have no effect in this mode), and the value is recorded in `config.json` like any other hyperparameter. This is a fixed penalty, not the paper's dual update; it is opt-in for comparison runs.
 
 ### 4. Separate update time scales
 
@@ -253,12 +275,13 @@ The reward critic and safety critic update every gradient step. The actor update
 | `--safety-lr` | `1e-4` | reachability safety-critic learning rate |
 | `--actor-lr` | `2e-5` | policy learning rate |
 | `--grad-clip` | `1.0` | max global gradient norm for all networks (`0` disables) |
-| `--multiplier-lr` | `1e-6` | statewise dual-ascent learning rate |
+| `--multiplier-lr` | `1e-5` | statewise dual-ascent learning rate |
 | `--policy-freq` | `2` | actor/target update interval |
 | `--multiplier-freq` | `6` | multiplier update interval |
-| `--max-lambda` | `100` | upper multiplier bound |
-| `--initial-lambda` | `10.0` | initial multiplier output; the fixed value in `--multiplier scalar` mode |
-| `--multiplier` | `scalar` | `scalar` for one fixed multiplier, `network` for the statewise `lambda(s)` network |
+| `--max-lambda` | `2.0` | upper multiplier bound (scaled with the reward divisor; equivalent to 100 at unscaled rewards) |
+| `--min-lambda` | `0.0` | lower multiplier bound; positive values keep the constraint from switching off (`0.0` reproduces the pure dual) |
+| `--initial-lambda` | `0.1` | initial multiplier output (network mode); the fixed value in `--multiplier scalar` mode |
+| `--multiplier` | `network` | `network` for the statewise `lambda(s)` network, `scalar` for one fixed multiplier |
 
 ### 5. Preserve stable TD3 reward learning
 
@@ -269,6 +292,27 @@ target = tau * online + (1 - tau) * target
 ```
 
 The actor, reward critic, safety critic, and each optimizer are saved in every RCRL checkpoint; in `--multiplier network` mode the multiplier network and its optimizer are saved as well (the fixed scalar needs no checkpoint file, it lives in `config.json`).
+
+## Reward scaling
+
+The RCRL actor loss adds a reward term and a safety term:
+
+```text
+mean(-Q(s, pi(s)) + lambda(s) Q_h(s, pi(s)))
+```
+
+The two must be on comparable scales, otherwise one term dominates for reasons that have nothing to do with the constraint. Raw corridor rewards are large relative to the constraint value: a successful episode returns roughly 50–100, while `Q_h` is bounded by the constraint range (a few metres at most). Evaluated at the same scale, a multiplier near 0.1 carries no weight against a `Q` near 100, so the dual can never make the constraint bite.
+
+The environment therefore divides every reward by a fixed `reward_scale`, recorded in `config.json`:
+
+| Option | Default | Purpose |
+| --- | ---: | --- |
+| `--reward-scale` | `50.0` (trainers), `1.0` (environment) | fixed divisor applied to every step reward and the goal bonus |
+| `--safety-margin` | `0.35` | constraint boundary in metres; see [Constraint convention](#constraint-convention) |
+
+This is deliberately not a running mean/std normalization. A fixed divisor keeps the MDP stationary — the same state-action pair always yields the same reward — which TD3's targets and the safety critic's fixed point assume. Running statistics would make the reward non-stationary and leak evaluation-time information into the scale.
+
+Reward scale and multiplier must be tuned together. Dividing rewards by 50 divides `Q` by 50, so a multiplier of `lambda = 0.1` produces the same safety pressure as `lambda = 5` did at unscaled rewards (multiplying the whole actor loss by 50 gives `-Q + 50 * lambda * Q_h`). The defaults (`--reward-scale 50`, `--initial-lambda 0.1`, `--max-lambda 2.0`) start the dual at that equivalent pressure and cap it at the scale-equivalent of the paper's unscaled bound of 100. The dual learning rate is `1e-5`. The multiplier network's hidden activations amplify these logit steps, so `lambda(s)` can still reach the cap during the early collision-heavy phase and then fall back once the safety critic stops flagging the visited states. Watch `mean_lambda`, `lambda_at_cap`, `lambda_at_floor`, and `mean_h_pred` in the training log: a sustained cap fraction means the bound is acting as a fixed penalty, while `lambda` close to the floor means the constraint has effectively switched off (unless the floor is set high on purpose). Evaluation falls back to `reward_scale = 1.0` for checkpoints trained before the field existed, so old models still evaluate with their original reward, and `--reward-scale` overrides the recorded value when needed.
 
 ## Randomized episodes
 

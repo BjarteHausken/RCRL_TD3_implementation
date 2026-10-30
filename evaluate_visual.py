@@ -24,7 +24,12 @@ def main(run_dir, test_layout="random", layout_set="one",
     agent_type = agent_type_from_config(config, run_dir)
     model_path = os.path.join(run_dir, agent_type)
 
-    env = create_env(layout_set, normalize_obs=normalize_obs)
+    env = create_env(
+        layout_set,
+        normalize_obs=normalize_obs,
+        safety_margin=config.get("safety_margin", 0.35),
+        reward_scale=config.get("reward_scale", 1.0),
+    )
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -42,6 +47,7 @@ def main(run_dir, test_layout="random", layout_set="one",
             multiplier_type=config.get("multiplier", "scalar"),
             max_lambda=config.get("max_lambda", 100.0),
             initial_lambda=config.get("initial_lambda", 10.0),
+            min_lambda=config.get("min_lambda", 0.0),
         )
     policy.load(model_path)
     print("Loaded model:", model_path)

@@ -44,7 +44,12 @@ def main(args):
     set_seed(args.seed)
 
     envs = [
-        create_env(args.layout_set, normalize_obs=args.normalize_obs)
+        create_env(
+            args.layout_set,
+            normalize_obs=args.normalize_obs,
+            safety_margin=args.safety_margin,
+            reward_scale=args.reward_scale,
+        )
         for _ in range(args.num_envs)
     ]
     state_dim = envs[0].observation_space.shape[0]
@@ -96,6 +101,8 @@ def main(args):
         "max_acceleration": envs[0].max_acceleration,
         "goal_radius": envs[0].goal_radius,
         "max_steps": envs[0].max_steps,
+        "safety_margin": envs[0].safety_margin,
+        "reward_scale": envs[0].reward_scale,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
@@ -235,6 +242,8 @@ def main(args):
                     episodes_per_layout=args.eval_episodes_per_layout,
                     random_reset_margin=args.random_reset_margin,
                     random_reset_max_speed=args.random_reset_max_speed,
+                    safety_margin=args.safety_margin,
+                    reward_scale=args.reward_scale,
                 )
                 print(
                     f"Evaluation at {env_steps_done}: "
@@ -243,7 +252,10 @@ def main(args):
                     f"success_rate={results['success_rate']:.1%} "
                     f"(95% CI {results['success_rate_ci'][0]:.1%}-"
                     f"{results['success_rate_ci'][1]:.1%}), "
-                    f"collision_rate={results['collision_rate']:.1%}"
+                    f"collision_rate={results['collision_rate']:.1%}, "
+                    f"margin_violation_rate={results['margin_violation_rate']:.1%}, "
+                    f"margin_step_fraction={results['margin_step_fraction']:.2%}, "
+                    f"mean_min_clearance={results['mean_min_clearance']:.3f} m"
                 )
                 policy.save(model_path)
     except KeyboardInterrupt:
@@ -305,6 +317,13 @@ def parse_args():
                              "boundary for sampled start and goal states")
     parser.add_argument("--random-reset-max-speed", type=float, default=1.0,
                         help="Maximum speed (m/s) of the sampled start velocity")
+    parser.add_argument("--safety-margin", type=float, default=0.35,
+                        help="Clearance (m from vehicle centre to obstacle "
+                             "surface) at which h(s) becomes positive; also "
+                             "defines the margin-violation metrics")
+    parser.add_argument("--reward-scale", type=float, default=50.0,
+                        help="Fixed reward divisor used by the environment; "
+                             "match it across agents so rewards are comparable")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
     parser.add_argument("--save-freq", type=int, default=5_000,
@@ -330,6 +349,10 @@ def parse_args():
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:
         parser.error("--random-reset-max-speed must be positive")
+    if args.safety_margin <= 0:
+        parser.error("--safety-margin must be positive")
+    if args.reward_scale <= 0:
+        parser.error("--reward-scale must be positive")
     if args.eval_episodes_per_layout < 1:
         parser.error("--eval-episodes-per-layout must be positive")
     if args.save_freq < 0:

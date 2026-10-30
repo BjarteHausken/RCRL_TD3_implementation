@@ -279,8 +279,8 @@ def test_batch_matches_single():
     # so a fixed layout, goal, and start state are shared by both envs.
     state = [10.0, 0.5, 1.0, -0.3]
     goal = [20.0, -1.0]
-    env_a = create_env("one")
-    env_b = create_env("one")
+    env_a = create_env("one", safety_margin=0.4, reward_scale=50.0)
+    env_b = create_env("one", safety_margin=0.4, reward_scale=50.0)
     for env in (env_a, env_b):
         env.reset(layout_type="train", layout_index=0, state=state, goal=goal)
 
@@ -436,6 +436,38 @@ def test_variable_layouts():
         )
     print("PASS: step_batch matches step across differing widths")
 
+def test_margin_constraint_and_reward_scale():
+    # Isolate the wall constraint (no pillars) so the nearest lidar return is
+    # exactly the distance to the top wall.
+    margin = 0.4
+    clear_env = create_env("one", safety_margin=margin)
+    clear_env.pillars = np.zeros((0, 3), dtype=np.float32)
+    clear_env.width = 5.0
+    clear_env.length = 30.0
+    clear_env._update_observation_scale()
+
+    # Clearance = width/2 - y. Inside the margin -> h > 0; outside -> h < 0.
+    for clearance, expected_positive in ((margin - 0.05, True), (margin + 0.05, False)):
+        state = [15.0, 0.0, clear_env.width / 2 - clearance, 0.0]
+        clear_env.reset(layout_type="fixed", state=state, goal=[20.0, 0.0])
+        lidar = clear_env.get_lidar()
+        h = clear_env._get_lidar_constraint(lidar)
+        np.testing.assert_allclose(h, margin - np.min(lidar), atol=1e-9)
+        assert (h > 0.0) == expected_positive, (clearance, h)
+    print("PASS: safety margin defines the constraint boundary")
+
+    # The reward divisor must scale both step and goal rewards consistently.
+    state = [10.0, 0.0, 0.0, 0.0]
+    goal = [20.0, 0.0]
+    world = [create_env("one", reward_scale=scale) for scale in (1.0, 50.0)]
+    rewards = []
+    for env in world:
+        env.reset(layout_type="fixed", state=state, goal=goal)
+        _, reward, *_ = env.step([0.5, 0.0])
+        rewards.append(reward)
+    np.testing.assert_allclose(rewards[0] / 50.0, rewards[1], atol=1e-9)
+    print("PASS: reward_scale divides the environment reward")
+
 def test_back_wall(env):
     # The corridor is closed at the goal end: touching or crossing
     # x = length - vehicle_radius collides, and lidar sees the wall.
@@ -469,6 +501,7 @@ test_randomized_reset(env)
 test_variable_layouts()
 test_goal(env)
 test_batch_matches_single()
+test_margin_constraint_and_reward_scale()
 test_back_wall(env)
 #test_velocity_limit(dynamics)
 test_reward_and_constraints(env)

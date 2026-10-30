@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import random
+import signal
 
 import numpy as np
 import torch
@@ -42,9 +43,16 @@ def set_seed(seed):
 
 
 def main(args):
+    # Treat SIGTERM like Ctrl-C so a killed run still writes a checkpoint.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     set_seed(args.seed)
 
-    env = create_env(args.layout_set, normalize_obs=args.normalize_obs)
+    env = create_env(
+        args.layout_set,
+        normalize_obs=args.normalize_obs,
+        safety_margin=args.safety_margin,
+        reward_scale=args.reward_scale,
+    )
     env.action_space.seed(args.seed)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -67,6 +75,7 @@ def main(args):
         multiplier_freq=args.multiplier_freq,
         max_lambda=args.max_lambda,
         initial_lambda=args.initial_lambda,
+        min_lambda=args.min_lambda,
         multiplier_type=args.multiplier,
     )
     if args.random_reset_max_speed > env.dynamics.max_velocity:
@@ -98,6 +107,8 @@ def main(args):
         "max_acceleration": env.max_acceleration,
         "goal_radius": env.goal_radius,
         "max_steps": env.max_steps,
+        "safety_margin": env.safety_margin,
+        "reward_scale": env.reward_scale,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
@@ -112,6 +123,8 @@ def main(args):
     )
     episode_reward = 0.0
     episode_steps = 0
+    episode_margin_steps = 0
+    episode_max_h = -np.inf
     episode_num = 0
 
     try:
@@ -127,6 +140,10 @@ def main(args):
 
             next_state, reward, terminated, truncated, info = env.step(action)
             episode_reward += reward
+            episode_margin_steps += int(info["constraint"] > 0.0)
+            episode_max_h = max(
+                episode_max_h, info["constraint"], info["next_constraint"]
+            )
 
             # info["constraint"] is h(s) and info["next_constraint"] is h(s').
             # Time-limit truncations retain bootstrap targets; collisions and goals do not.
@@ -149,22 +166,33 @@ def main(args):
                     print(
                         f"Episode {episode_num:4d} | step {timestep + 1:7d} | "
                         f"length {episode_steps:4d} | reward {episode_reward:8.3f} | "
-                        f"collision {info['collision']} | goal {info['goal_reached']}"
+                        f"collision {info['collision']} | goal {info['goal_reached']} | "
+                        f"margin_steps {episode_margin_steps:3d} | "
+                        f"max_h {episode_max_h:+.3f}"
                     )
                 state, _ = episode_reset(
                     env, args.random_reset_margin, args.random_reset_max_speed
                 )
                 episode_reward = 0.0
                 episode_steps = 0
+                episode_margin_steps = 0
+                episode_max_h = -np.inf
                 episode_num += 1
 
             if args.log_freq > 0 and (timestep + 1) % args.log_freq == 0:
-                with torch.no_grad():
-                    mean_lambda = policy.mean_lambda(state)
-                print(
+                lambda_stats = policy.lambda_stats(state)
+                message = (
                     f"Step {timestep + 1}: replay_size={replay_buffer.size}, "
-                    f"mean_lambda={mean_lambda:.4f}"
+                    f"mean_lambda={lambda_stats['mean']:.4f}, "
+                    f"max_lambda={lambda_stats['max']:.4f}, "
+                    f"mean_h_pred={policy.policy_safety_value(state):+.4f}"
                 )
+                if "cap_fraction" in lambda_stats:
+                    message += (
+                        f", lambda_at_cap={lambda_stats['cap_fraction']:.1%}, "
+                        f"lambda_at_floor={lambda_stats['floor_fraction']:.1%}"
+                    )
+                print(message)
 
             if args.save_freq > 0 and (timestep + 1) % args.save_freq == 0:
                 policy.save(model_path)
@@ -178,6 +206,8 @@ def main(args):
                     episodes_per_layout=args.eval_episodes_per_layout,
                     random_reset_margin=args.random_reset_margin,
                     random_reset_max_speed=args.random_reset_max_speed,
+                    safety_margin=args.safety_margin,
+                    reward_scale=args.reward_scale,
                 )
                 print(
                     f"Evaluation at {timestep + 1}: "
@@ -186,7 +216,10 @@ def main(args):
                     f"success_rate={results['success_rate']:.1%} "
                     f"(95% CI {results['success_rate_ci'][0]:.1%}-"
                     f"{results['success_rate_ci'][1]:.1%}), "
-                    f"collision_rate={results['collision_rate']:.1%}"
+                    f"collision_rate={results['collision_rate']:.1%}, "
+                    f"margin_violation_rate={results['margin_violation_rate']:.1%}, "
+                    f"margin_step_fraction={results['margin_step_fraction']:.2%}, "
+                    f"mean_min_clearance={results['mean_min_clearance']:.3f} m"
                 )
                 policy.save(model_path)
     except KeyboardInterrupt:
@@ -237,16 +270,32 @@ def parse_args():
     parser.add_argument("--safety-lr", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Max global gradient norm for all networks; 0 disables clipping")
-    parser.add_argument("--multiplier-lr", type=float, default=1e-6)
+    parser.add_argument("--multiplier-lr", type=float, default=1e-5,
+                        help="Statewise dual-ascent learning rate (network "
+                             "mode); 1e-5 moves lambda(s) on the safety-"
+                             "critic timescale without racing to the cap "
+                             "during the early collision-heavy phase")
     parser.add_argument("--multiplier-freq", type=int, default=6)
-    parser.add_argument("--max-lambda", type=float, default=100.0)
-    parser.add_argument("--initial-lambda", type=float, default=10.0)
+    parser.add_argument("--max-lambda", type=float, default=2.0,
+                        help="Upper multiplier bound. Scaled with the reward "
+                             "divisor: 2.0 at --reward-scale 50 is equivalent "
+                             "to 100 with unscaled rewards")
+    parser.add_argument("--initial-lambda", type=float, default=0.1,
+                        help="Initial lambda; with normalized rewards "
+                             "(default --reward-scale 50) 0.1 keeps the "
+                             "safety term comparable to the reward term")
+    parser.add_argument("--min-lambda", type=float, default=0.0,
+                        help="Floor of the statewise lambda(s) network. The "
+                             "dual drives lambda to zero on a safe-dominated "
+                             "visited distribution, switching the constraint "
+                             "off; a positive floor keeps a minimum safety "
+                             "pressure. 0 reproduces the pure dual")
     parser.add_argument(
         "--multiplier",
         choices=["network", "scalar"],
-        default="scalar",
-        help="'network' uses a statewise lambda(s) network; 'scalar' uses a "
-             "single fixed Lagrange multiplier for all states, set by "
+        default="network",
+        help="'network' uses a statewise lambda(s) network (RCRL); 'scalar' "
+             "uses a single fixed Lagrange multiplier for all states, set by "
              "--initial-lambda and not updated during training",
     )
     parser.add_argument("--random-reset-margin", type=float, default=0.3,
@@ -254,6 +303,15 @@ def parse_args():
                              "boundary for sampled start and goal states")
     parser.add_argument("--random-reset-max-speed", type=float, default=1.0,
                         help="Maximum speed (m/s) of the sampled start velocity")
+    parser.add_argument("--safety-margin", type=float, default=0.35,
+                        help="Clearance (m from vehicle centre to obstacle "
+                             "surface) at which h(s) becomes positive; must "
+                             "be at least vehicle_radius (0.2) and is "
+                             "independent of collision termination")
+    parser.add_argument("--reward-scale", type=float, default=50.0,
+                        help="Fixed reward divisor used by the environment; "
+                             "50 puts the goal bonus at 1.0 so reward and "
+                             "safety terms have comparable scale")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
     parser.add_argument("--save-freq", type=int, default=5_000,
@@ -275,12 +333,25 @@ def parse_args():
         parser.error("--policy-freq must be positive")
     if args.multiplier_freq < args.policy_freq:
         parser.error("--multiplier-freq must be at least --policy-freq")
-    if args.max_lambda <= 0 or not 0 < args.initial_lambda <= args.max_lambda:
-        parser.error("--initial-lambda must be in (0, --max-lambda]")
+    if args.max_lambda <= 0 or not 0 < args.initial_lambda:
+        parser.error("--max-lambda and --initial-lambda must be positive")
+    if args.min_lambda < 0:
+        parser.error("--min-lambda must be nonnegative")
+    if args.multiplier == "network" and not (
+        args.min_lambda < args.initial_lambda < args.max_lambda
+    ):
+        parser.error(
+            "network mode requires --min-lambda < --initial-lambda "
+            "< --max-lambda"
+        )
     if args.random_reset_margin < 0:
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:
         parser.error("--random-reset-max-speed must be positive")
+    if args.safety_margin <= 0:
+        parser.error("--safety-margin must be positive")
+    if args.reward_scale <= 0:
+        parser.error("--reward-scale must be positive")
     if args.eval_episodes_per_layout < 1:
         parser.error("--eval-episodes-per-layout must be positive")
     if args.save_freq < 0:
