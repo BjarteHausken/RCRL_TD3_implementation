@@ -70,6 +70,11 @@ def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
     # the rendered episode is reproducible for a fixed model and layout.
     random_reset_margin = config.get("random_reset_margin", 0.3)
     random_reset_max_speed = config.get("random_reset_max_speed", 1.0)
+    # Match the sampled start-goal distribution used in training; older
+    # checkpoints fall back to the previous two-goal-radius minimum.
+    min_start_goal_distance = config.get("min_start_goal_distance")
+    if min_start_goal_distance is None:
+        min_start_goal_distance = 2 * env.goal_radius
     state, _ = env.reset(
         layout_type="test",
         layout_index=layout_idx,
@@ -78,7 +83,7 @@ def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
         start_margin=random_reset_margin,
         start_max_speed=random_reset_max_speed,
         goal_margin=random_reset_margin,
-        min_start_goal_distance=2 * env.goal_radius,
+        min_start_goal_distance=min_start_goal_distance,
     )
 
     if output is None:

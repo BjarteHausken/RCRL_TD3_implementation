@@ -15,14 +15,18 @@ from evaluation import evaluate_policy
 from utils import ReplayBufferRCRLTD3
 
 
-def episode_reset(env, random_reset_margin, random_reset_max_speed, seed=None):
+def episode_reset(env, random_reset_margin, random_reset_max_speed,
+                  min_start_goal_distance=None, seed=None):
     """Reset into a new randomized training episode in one call.
 
     ``reset`` selects the layout first and then samples a feasible start and
     goal on that layout, so both always satisfy the clearance margins for the
     layout the episode actually runs on. The goal is resampled until it is at
-    least two goal radii from the start.
+    least ``min_start_goal_distance`` from the start; when that is None the
+    default is two goal radii.
     """
+    if min_start_goal_distance is None:
+        min_start_goal_distance = 2 * env.goal_radius
     return env.reset(
         layout_type="train",
         seed=seed,
@@ -30,7 +34,7 @@ def episode_reset(env, random_reset_margin, random_reset_max_speed, seed=None):
         start_margin=random_reset_margin,
         start_max_speed=random_reset_max_speed,
         goal_margin=random_reset_margin,
-        min_start_goal_distance=2 * env.goal_radius,
+        min_start_goal_distance=min_start_goal_distance,
     )
 
 
@@ -54,6 +58,8 @@ def main(args):
         reward_scale=args.reward_scale,
     )
     env.action_space.seed(args.seed)
+    if args.min_start_goal_distance is None:
+        args.min_start_goal_distance = 2.0 * env.goal_radius
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
@@ -119,7 +125,11 @@ def main(args):
 
     # The first episode reset also seeds the environment RNG.
     state, _ = episode_reset(
-        env, args.random_reset_margin, args.random_reset_max_speed, seed=args.seed
+        env,
+        args.random_reset_margin,
+        args.random_reset_max_speed,
+        min_start_goal_distance=args.min_start_goal_distance,
+        seed=args.seed,
     )
     episode_reward = 0.0
     episode_steps = 0
@@ -171,7 +181,10 @@ def main(args):
                         f"max_h {episode_max_h:+.3f}"
                     )
                 state, _ = episode_reset(
-                    env, args.random_reset_margin, args.random_reset_max_speed
+                    env,
+                    args.random_reset_margin,
+                    args.random_reset_max_speed,
+                    min_start_goal_distance=args.min_start_goal_distance,
                 )
                 episode_reward = 0.0
                 episode_steps = 0
@@ -206,6 +219,7 @@ def main(args):
                     episodes_per_layout=args.eval_episodes_per_layout,
                     random_reset_margin=args.random_reset_margin,
                     random_reset_max_speed=args.random_reset_max_speed,
+                    min_start_goal_distance=args.min_start_goal_distance,
                     safety_margin=args.safety_margin,
                     reward_scale=args.reward_scale,
                 )
@@ -303,6 +317,12 @@ def parse_args():
                              "boundary for sampled start and goal states")
     parser.add_argument("--random-reset-max-speed", type=float, default=1.0,
                         help="Maximum speed (m/s) of the sampled start velocity")
+    parser.add_argument("--min-start-goal-distance", type=float, default=None,
+                        help="Minimum start-goal distance (m) for sampled "
+                             "episodes; default is 2 * goal_radius (1.0 m). "
+                             "Distances close to the corridor length may be "
+                             "infeasible on some layouts, in which case reset "
+                             "raises an error")
     parser.add_argument("--safety-margin", type=float, default=0.35,
                         help="Clearance (m from vehicle centre to obstacle "
                              "surface) at which h(s) becomes positive; must "
@@ -348,6 +368,9 @@ def parse_args():
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:
         parser.error("--random-reset-max-speed must be positive")
+    if (args.min_start_goal_distance is not None
+            and args.min_start_goal_distance < 0):
+        parser.error("--min-start-goal-distance must be nonnegative")
     if args.safety_margin <= 0:
         parser.error("--safety-margin must be positive")
     if args.reward_scale <= 0:

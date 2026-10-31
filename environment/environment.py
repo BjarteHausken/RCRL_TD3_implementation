@@ -187,6 +187,9 @@ class CorridorEnvironment(gym.Env):
         Sampling happens after the layout is selected, so the sampled start
         and goal are always feasible for the layout the episode runs on.
         """
+        if min_start_goal_distance is not None and min_start_goal_distance < 0:
+            raise ValueError("min_start_goal_distance must be nonnegative")
+
         super().reset(seed=seed)
 
         layouts = {
@@ -214,7 +217,11 @@ class CorridorEnvironment(gym.Env):
                     start_x, start_y = start_position[0], start_position[2]
                 else:
                     start_x, start_y = start_position[0], start_position[1]
-                while True:
+                # A requested distance close to the corridor extent can be
+                # infeasible for a given start, so the resampling is bounded
+                # instead of looping forever.
+                max_goal_attempts = 1000
+                for _ in range(max_goal_attempts):
                     goal_position = np.asarray(goal, dtype=np.float64).reshape(-1)
                     if goal_position.size >= 4:
                         goal_x, goal_y = goal_position[0], goal_position[2]
@@ -226,6 +233,14 @@ class CorridorEnvironment(gym.Env):
                         break
                     goal = self.sample_random_state(
                         margin=goal_margin, max_speed=0.0
+                    )
+                else:
+                    raise RuntimeError(
+                        "could not sample a goal at least "
+                        f"{min_start_goal_distance:.2f} m from the start "
+                        f"after {max_goal_attempts} attempts; the requested "
+                        "distance may be infeasible for this layout "
+                        f"({self.length:.1f} m x {self.width:.1f} m)"
                     )
 
         goal_state = np.asarray(goal, dtype=np.float64).reshape(-1)

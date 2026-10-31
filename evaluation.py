@@ -41,6 +41,7 @@ def evaluate_policy(
     episodes_per_layout=20,
     random_reset_margin=0.3,
     random_reset_max_speed=1.0,
+    min_start_goal_distance=None,
     safety_margin=0.35,
     reward_scale=1.0,
 ):
@@ -51,6 +52,10 @@ def evaluate_policy(
     and speed bound as training, so evaluation and training share an episode
     distribution. All episodes are stepped in parallel; once an episode
     terminates or is truncated it leaves the batch.
+
+    ``min_start_goal_distance`` bounds the sampled start-to-goal distance
+    (default ``2 * goal_radius``); it should match the value used in training
+    so evaluation and training share an episode distribution.
 
     ``safety_margin`` defines the constraint used for the violation metrics:
     ``h(s) = safety_margin - min(lidar)`` and ``h(s) > 0`` is a margin
@@ -83,6 +88,8 @@ def evaluate_policy(
         safety_margin=safety_margin,
         reward_scale=reward_scale,
     )
+    if min_start_goal_distance is None:
+        min_start_goal_distance = 2 * reference.goal_radius
     layouts = (
         reference.val_layouts if layout_type == "val" else reference.test_layouts
     )
@@ -109,7 +116,7 @@ def evaluate_policy(
             start_margin=random_reset_margin,
             start_max_speed=random_reset_max_speed,
             goal_margin=random_reset_margin,
-            min_start_goal_distance=2 * env.goal_radius,
+            min_start_goal_distance=min_start_goal_distance,
         )
         envs.append(env)
 

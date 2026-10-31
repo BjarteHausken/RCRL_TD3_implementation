@@ -344,6 +344,48 @@ def test_randomized_reset(env):
 
     print("PASS: randomized reset start and goal respect margins")
 
+def test_min_start_goal_distance(env):
+    # A feasible minimum distance is respected, and an infeasible one raises
+    # instead of resampling the goal forever.
+    distance = 12.0
+    env.reset(
+        layout_type="train",
+        layout_index=0,
+        seed=0,
+        sample_start=True,
+        min_start_goal_distance=distance,
+    )
+    x, _, y, _ = env.dynamics.get_state()
+    goal_x, goal_y = env.goal
+    assert np.hypot(x - goal_x, y - goal_y) > distance, (x, y, goal_x, goal_y)
+
+    try:
+        env.reset(
+            layout_type="train",
+            layout_index=0,
+            sample_start=True,
+            min_start_goal_distance=-1.0,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("negative minimum distance was accepted")
+
+    try:
+        env.reset(
+            layout_type="train",
+            layout_index=0,
+            seed=0,
+            sample_start=True,
+            min_start_goal_distance=100.0,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("infeasible minimum distance did not raise")
+
+    print("PASS: minimum start-goal distance and infeasibility guard")
+
 def test_variable_layouts():
     # Generated layouts carry their own width and pillar count. reset() must
     # adopt both before sampling the start and goal, so both are feasible for
@@ -498,6 +540,7 @@ test_lidar_at(env)
 test_gymnasium_env(env)
 test_random_state_sampling(env)
 test_randomized_reset(env)
+test_min_start_goal_distance(env)
 test_variable_layouts()
 test_goal(env)
 test_batch_matches_single()

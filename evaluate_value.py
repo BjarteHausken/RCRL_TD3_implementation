@@ -172,6 +172,9 @@ class ValueExplorer:
         self.hover_enabled = hover
         self.reset_margin = config.get("random_reset_margin", 0.3)
         self.reset_max_speed = config.get("random_reset_max_speed", 1.0)
+        self.min_start_goal_distance = config.get("min_start_goal_distance")
+        if self.min_start_goal_distance is None:
+            self.min_start_goal_distance = 2.0 * env.goal_radius
         self._suspend = False
         self._last_hover_time = 0.0
 
@@ -224,7 +227,7 @@ class ValueExplorer:
             start_margin=self.reset_margin,
             start_max_speed=self.reset_max_speed,
             goal_margin=self.reset_margin,
-            min_start_goal_distance=2.0 * self.env.goal_radius,
+            min_start_goal_distance=self.min_start_goal_distance,
         )
         # reset() returns the observation; the sampled dynamics state is the
         # (x, x_dot, y, y_dot) vector stored on the environment.

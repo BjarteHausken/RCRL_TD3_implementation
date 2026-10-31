@@ -172,7 +172,7 @@ Per-layout output also shows how many episodes had a margin violation and the me
 
 Evaluation is batched: all episodes are stepped in parallel through `environment.step_batch`, with one actor forward pass over the stacked observations per timestep instead of one pass per episode. Finished episodes leave the batch immediately, so the loop stops as soon as every episode is done. The sampled starts, goals, and stopping rules match the sequential evaluation. Because the actor runs in a batch, floating-point accumulation differs slightly from single-row forwards, so individual episode rewards can shift marginally while the episode outcomes and step counts remain the same.
 
-The evaluation scripts read the `agent` field in the run's `config.json` to select the agent type (TD3 or RCRL-TD3), so `--agent` is not needed; a run whose `config.json` does not record a valid agent type cannot be evaluated. For RCRL-TD3 the scripts also reconstruct the exact agent (`--multiplier`, `--initial-lambda`, `--max-lambda`, and `--min-lambda`), so a checkpoint loads against the same network structure and multiplier parameterisation it was saved with. The evaluation sampling margin and speed bound are also read from the run's `config.json`.
+The evaluation scripts read the `agent` field in the run's `config.json` to select the agent type (TD3 or RCRL-TD3), so `--agent` is not needed; a run whose `config.json` does not record a valid agent type cannot be evaluated. For RCRL-TD3 the scripts also reconstruct the exact agent (`--multiplier`, `--initial-lambda`, `--max-lambda`, and `--min-lambda`), so a checkpoint loads against the same network structure and multiplier parameterisation it was saved with. The evaluation sampling margin, speed bound, and minimum start-goal distance are also read from the run's `config.json` (the distance can be overridden with `--min-start-goal-distance`).
 
 `evaluate_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout.
 
@@ -322,9 +322,9 @@ One `env.reset(...)` call does all of the following, in this order:
 
 1. select a **layout** uniformly from the training layouts,
 2. sample a **start state** via `CorridorEnvironment.sample_random_state` on that layout — a position with `vehicle_radius + margin` clearance from the walls and `pillar_radius + vehicle_radius + margin` clearance from every pillar, and a velocity drawn uniformly from a disk of radius `--random-reset-max-speed`, and
-3. sample a **goal** the same way (with zero velocity), resampled until it is at least `2 * goal_radius` away from the start.
+3. sample a **goal** the same way (with zero velocity), resampled until it is at least `--min-start-goal-distance` away from the start (default `2 * goal_radius`, 1.0 m).
 
-Sampling after the layout is selected guarantees the start and goal are feasible for the layout the episode actually runs on.
+Sampling after the layout is selected guarantees the start and goal are feasible for the layout the episode actually runs on. With a large minimum distance, some layouts admit few or no valid goal positions for a given start; the goal resampling is bounded and `reset` raises a `RuntimeError` instead of looping forever when no valid goal is found within 1000 attempts. The resolved distance is recorded in `config.json`, and evaluation uses it unless `evaluate.py --min-start-goal-distance` overrides it; checkpoints without the field fall back to two goal radii.
 
 Full RCRL training runs from step 0 — there is no separate exploration or warm-up phase; exploration comes from the per-step action noise (`--expl-noise`).
 
@@ -332,6 +332,7 @@ Full RCRL training runs from step 0 — there is no separate exploration or warm
 | --- | ---: | --- |
 | `--random-reset-margin` | `0.3` | extra clearance (m) beyond the collision boundary for sampled start and goal states |
 | `--random-reset-max-speed` | `1.0` | maximum speed (m/s) of the sampled start velocity |
+| `--min-start-goal-distance` | `2 * goal_radius` | minimum Euclidean start-goal distance (m) for sampled episodes; infeasible values raise an error at reset |
 
 Evaluation follows the same regime: `evaluate.py` runs `--eval-episodes-per-layout` episodes (default 20) per test layout, each with a freshly sampled start and goal and seeded by episode index. `evaluate_visual.py` and `evaluate_gif.py` render one episode per layout, seeded by layout index.
 

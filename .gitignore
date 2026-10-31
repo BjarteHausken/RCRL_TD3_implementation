@@ -17,6 +17,7 @@ __pycache__/
 /models/
 /layouts/
 /gifs/
+/results/
 
 # Local agent guidance (kept out of the public repository)
 /AGENTS.md

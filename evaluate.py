@@ -44,7 +44,8 @@ def _json_safe(value):
 
 
 def save_evaluation_json(path, results, config, run_dir, layout_set,
-                         normalize_obs, safety_margin, reward_scale):
+                         normalize_obs, safety_margin, reward_scale,
+                         min_start_goal_distance):
     """Write an evaluation report, including per-episode arrays, as JSON.
 
     The per-episode arrays use the same seeded start/goal pairs across runs,
@@ -64,6 +65,7 @@ def save_evaluation_json(path, results, config, run_dir, layout_set,
         "reward_scale": float(reward_scale),
         "random_reset_margin": config.get("random_reset_margin", 0.3),
         "random_reset_max_speed": config.get("random_reset_max_speed", 1.0),
+        "min_start_goal_distance": float(min_start_goal_distance),
         "metrics": _json_safe({
             key: results[key]
             for key in (
@@ -112,7 +114,8 @@ def save_evaluation_json(path, results, config, run_dir, layout_set,
 
 
 def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
-         safety_margin=None, reward_scale=None, save_json=None):
+         safety_margin=None, reward_scale=None, min_start_goal_distance=None,
+         save_json=None):
     config = load_config(run_dir)
     agent_type = agent_type_from_config(config, run_dir)
     model_path = os.path.join(run_dir, agent_type)
@@ -131,6 +134,14 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
         safety_margin=safety_margin,
         reward_scale=reward_scale,
     )
+
+    # The sampled episode distribution is a property of the run: use the
+    # distance recorded at training time, falling back to two goal radii for
+    # checkpoints written before the field existed.
+    if min_start_goal_distance is None:
+        min_start_goal_distance = config.get("min_start_goal_distance")
+    if min_start_goal_distance is None:
+        min_start_goal_distance = 2.0 * env.goal_radius
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -164,6 +175,7 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
         episodes_per_layout=episodes_per_layout,
         random_reset_margin=config.get("random_reset_margin", 0.3),
         random_reset_max_speed=config.get("random_reset_max_speed", 1.0),
+        min_start_goal_distance=min_start_goal_distance,
         safety_margin=safety_margin,
         reward_scale=reward_scale,
     )
@@ -216,6 +228,7 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
             normalize_obs,
             safety_margin,
             reward_scale,
+            min_start_goal_distance,
         )
         print(f"Saved JSON: {save_json}")
 
@@ -270,6 +283,13 @@ if __name__ == "__main__":
         help="Override the reward divisor recorded in config.json",
     )
     parser.add_argument(
+        "--min-start-goal-distance",
+        type=float,
+        default=None,
+        help="Override the minimum start-goal distance (m) recorded in "
+             "config.json",
+    )
+    parser.add_argument(
         "--save-json",
         metavar="PATH",
         default=None,
@@ -285,6 +305,9 @@ if __name__ == "__main__":
         parser.error("--safety-margin must be positive")
     if args.reward_scale is not None and args.reward_scale <= 0:
         parser.error("--reward-scale must be positive")
+    if (args.min_start_goal_distance is not None
+            and args.min_start_goal_distance < 0):
+        parser.error("--min-start-goal-distance must be nonnegative")
 
     run_dir = os.path.join("models", args.name)
 
@@ -295,5 +318,6 @@ if __name__ == "__main__":
         args.eval_episodes_per_layout,
         safety_margin=args.safety_margin,
         reward_scale=args.reward_scale,
+        min_start_goal_distance=args.min_start_goal_distance,
         save_json=args.save_json,
     )
