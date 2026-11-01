@@ -127,6 +127,11 @@ class RCRLTD3:
     TD3 target-policy smoothing applies to reward targets only. RCRL safety
     targets evaluate the unperturbed target policy as required by its Bellman
     equation.
+
+    Both the actor's safety term and the multiplier's dual objective hinge on
+    positive safety values. Safe states therefore receive no clearance bonus
+    and cannot drag the multiplier down; only predicted constraint violations
+    raise it.
     """
 
     def __init__(
@@ -329,7 +334,9 @@ class RCRLTD3:
             q_pi = self.critic.q1(state, policy_action)
             qh_pi = self.safety_critic(state, policy_action)
             lambda_s = self.multiplier_for(state).detach()
-            actor_loss = (-q_pi + lambda_s * qh_pi).mean()
+            # Hinge on predicted violations only: safe states must not earn a
+            # clearance bonus that pushes the policy away from usable gaps.
+            actor_loss = (-q_pi + lambda_s * torch.relu(qh_pi)).mean()
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
@@ -346,8 +353,10 @@ class RCRLTD3:
             with torch.no_grad():
                 multiplier_action = self.actor(state)
                 multiplier_safety_value = self.safety_critic(state, multiplier_action)
+            # Same hinge in the dual: safe-dominated batches no longer drag
+            # lambda down, only positive predicted violations raise it.
             multiplier_loss = -(
-                self.multiplier(state) * multiplier_safety_value
+                self.multiplier(state) * torch.relu(multiplier_safety_value)
             ).mean()
             self.multiplier_optimizer.zero_grad()
             multiplier_loss.backward()
