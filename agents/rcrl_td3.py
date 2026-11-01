@@ -128,10 +128,9 @@ class RCRLTD3:
     targets evaluate the unperturbed target policy as required by its Bellman
     equation.
 
-    Both the actor's safety term and the multiplier's dual objective hinge on
-    positive safety values. Safe states therefore receive no clearance bonus
-    and cannot drag the multiplier down; only predicted constraint violations
-    raise it.
+    The actor's safety term hinges on positive safety values, so safe states
+    receive no clearance bonus. The multiplier keeps the unhinged dual
+    objective, so lambda can fall again once predicted violations disappear.
     """
 
     def __init__(
@@ -353,10 +352,10 @@ class RCRLTD3:
             with torch.no_grad():
                 multiplier_action = self.actor(state)
                 multiplier_safety_value = self.safety_critic(state, multiplier_action)
-            # Same hinge in the dual: safe-dominated batches no longer drag
-            # lambda down, only positive predicted violations raise it.
+            # Keep the unhinged dual: unlike the actor term, lambda must be
+            # able to fall when predicted violations disappear.
             multiplier_loss = -(
-                self.multiplier(state) * torch.relu(multiplier_safety_value)
+                self.multiplier(state) * multiplier_safety_value
             ).mean()
             self.multiplier_optimizer.zero_grad()
             multiplier_loss.backward()
