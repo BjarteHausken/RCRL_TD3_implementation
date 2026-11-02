@@ -140,7 +140,6 @@ def save_comparison_figure(path, entries, episodes_per_layout):
         ("Collision rate (95% CI)", "collision_rate", "collision_rate_ci", 100, "{:.1f}%"),
         ("Margin violations (95% CI)", "margin_violation_rate",
          "margin_violation_rate_ci", 100, "{:.1f}%"),
-        ("Steps in margin", "margin_step_fraction", None, 100, "{:.1f}%"),
     ):
         values = [scale * results[key] for _, _, results in entries]
         if ci_key is None:
@@ -155,6 +154,17 @@ def save_comparison_figure(path, entries, episodes_per_layout):
 
     clearance = [results["mean_min_clearance"] for _, _, results in entries]
     panels.append(("Mean min clearance (m)", clearance, None, "{:.2f}"))
+
+    # Cost of safety: how long successful episodes take. None (bar omitted)
+    # for runs with no successes.
+    cost_of_safety = []
+    for _, _, results in entries:
+        mask = results["successes"]
+        cost_of_safety.append(
+            float(results["steps"][mask].mean()) if mask.any() else None
+        )
+    panels.append(("Mean steps on successes (cost of safety)",
+                   cost_of_safety, None, "{:.0f}"))
 
     lambda_values = []
     for _, config, results in entries:
@@ -220,6 +230,103 @@ def save_comparison_figure(path, entries, episodes_per_layout):
     # Reserve room for the suptitle, the footnote, and the rotated row-1
     # tick labels hanging below the top panels.
     fig.tight_layout(rect=(0, 0.04, 1, 0.93), h_pad=6)
+
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_layout_figure(path, entries, episodes_per_layout):
+    """Render a per-layout difficulty analysis for presentations.
+
+    Panel 1 shows the success rate on every test layout (one line per run).
+    Panels 2 and 3 pair layouts across runs and therefore only include runs
+    whose layout set and layout count match the first run's.
+    """
+    names = [_short_name(name) for name, _, _ in entries]
+    colors = [plt.cm.tab10(i % 10) for i in range(len(entries))]
+
+    baseline = 0
+    base_config = entries[baseline][1]
+    base_results = entries[baseline][2]
+    base_n_layouts = len(base_results["per_layout_success_rate"])
+    pairable = [
+        i for i, (_, config, results) in enumerate(entries)
+        if config.get("layout_set") == base_config.get("layout_set")
+        and len(results["per_layout_success_rate"]) == base_n_layouts
+    ]
+    layout_label = str(base_config.get("layout_set"))
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    axis = axes[0]
+    for i, (_, _, results) in enumerate(entries):
+        per_layout = results["per_layout_success_rate"]
+        axis.plot(
+            np.arange(len(per_layout)), per_layout,
+            color=colors[i], label=names[i], linewidth=1.0, alpha=0.8,
+        )
+    axis.set_title("Success rate by layout", fontsize=13, fontweight="bold")
+    axis.set_xlabel("layout index")
+    axis.set_ylabel("success rate")
+    axis.set_ylim(0, 1)
+
+    axis = axes[1]
+    base_success = base_results["per_layout_success_rate"]
+    axis.plot([0, 1], [0, 1], "k--", alpha=0.3)
+    for i in pairable:
+        if i == baseline:
+            continue
+        axis.scatter(
+            base_success, entries[i][2]["per_layout_success_rate"],
+            color=colors[i], label=names[i], alpha=0.6,
+        )
+    axis.set_title("Per layout vs baseline (above diagonal: better)",
+                   fontsize=13, fontweight="bold")
+    axis.set_xlabel(f"success rate — {names[baseline]}")
+    axis.set_ylabel("success rate")
+    axis.set_xlim(0, 1)
+    axis.set_ylim(0, 1)
+
+    axis = axes[2]
+    for i in pairable:
+        results = entries[i][2]
+        axis.scatter(
+            results["per_layout_margin_violation_rate"],
+            results["per_layout_success_rate"],
+            color=colors[i], label=names[i], alpha=0.6,
+        )
+    axis.set_title("Per layout: success vs margin violations",
+                   fontsize=13, fontweight="bold")
+    axis.set_xlabel("margin violation rate")
+    axis.set_ylabel("success rate")
+    axis.set_xlim(0, 1)
+    axis.set_ylim(0, 1)
+
+    for axis in axes:
+        axis.legend(fontsize=9)
+        for spine in ("top", "right"):
+            axis.spines[spine].set_visible(False)
+        axis.grid(linestyle=":", alpha=0.5)
+
+    fig.suptitle(
+        f"Per-layout analysis — {layout_label} test layouts, "
+        f"{episodes_per_layout} episodes per layout",
+        fontsize=16,
+        fontweight="bold",
+    )
+    note = ("Each point/line is one layout; rates use "
+            f"{episodes_per_layout} episodes, so they are coarse. Panel 1 "
+            "shows each run's own test layouts, so layout indices are only "
+            "comparable between runs sharing a layout set.")
+    if len(pairable) < len(entries):
+        excluded = ", ".join(names[i] for i in range(len(entries))
+                             if i not in pairable)
+        note += (f" Runs with a different layout set or layout count "
+                 f"({excluded}) are excluded from the two paired panels.")
+    fig.text(0.5, 0.01, note, ha="center", fontsize=10, color="0.3")
+    fig.tight_layout(rect=(0, 0.05, 1, 0.92))
 
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
@@ -295,7 +402,8 @@ def save_comparison_json(path, entries, episodes_per_layout):
         file.write("\n")
 
 
-def main(names, episodes_per_layout=20, save_json=None, save_png=None):
+def main(names, episodes_per_layout=20, save_json=None, save_png=None,
+         save_layout_png=None):
     if len(names) < 2:
         raise SystemExit("Pass at least two run names to compare")
 
@@ -323,6 +431,9 @@ def main(names, episodes_per_layout=20, save_json=None, save_png=None):
     if save_png is not None:
         save_comparison_figure(save_png, entries, episodes_per_layout)
         print(f"Saved figure: {save_png}")
+    if save_layout_png is not None:
+        save_layout_figure(save_layout_png, entries, episodes_per_layout)
+        print(f"Saved layout figure: {save_layout_png}")
 
 
 if __name__ == "__main__":
@@ -356,6 +467,14 @@ if __name__ == "__main__":
         help="Write a bar-chart comparison figure (one panel per key "
              "metric) to PATH, for use in presentations",
     )
+    parser.add_argument(
+        "--save-layout-png",
+        metavar="PATH",
+        default=None,
+        help="Write a per-layout difficulty analysis figure (success rate "
+             "by layout, per layout vs baseline, per-layout success vs "
+             "margin violations) to PATH",
+    )
 
     args = parser.parse_args()
 
@@ -367,4 +486,5 @@ if __name__ == "__main__":
         args.episodes_per_layout,
         save_json=args.save_json,
         save_png=args.save_png,
+        save_layout_png=args.save_layout_png,
     )
