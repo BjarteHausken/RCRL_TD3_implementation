@@ -16,7 +16,6 @@ def create_env(
     goal_radius=0.5,
     max_steps=1000,
     normalize_obs=True,
-    safety_margin=0.35,
     reward_scale=1.0,
 ):
     """Corridor environment with the standard training/evaluation parameters.
@@ -25,11 +24,9 @@ def create_env(
     ``DoubleIntegratorExactDiscretization`` and ``CorridorEnvironment``;
     the defaults are the values the training and evaluation scripts use.
 
-    ``safety_margin`` is the clearance (metres from the vehicle centre to the
-    nearest obstacle surface) at which ``h(s)`` becomes positive. It must be
-    at least ``vehicle_radius`` (the collision boundary) so the constraint can
-    be violated without terminating the episode. ``reward_scale`` divides the
-    environment reward; trainers default it to ``50.0`` so the reward and
+    The state constraint is ``h(s) = vehicle_radius - min(lidar)``; there is
+    no separate safety margin in the environment. ``reward_scale`` divides
+    the environment reward; trainers default it to ``50.0`` so the reward and
     safety terms in the RCRL actor loss have comparable magnitudes.
     """
     dynamics = DoubleIntegratorExactDiscretization(dt=dt, max_velocity=max_velocity)
@@ -46,6 +43,5 @@ def create_env(
         goal_radius=goal_radius,
         max_steps=max_steps,
         normalize_obs=normalize_obs,
-        safety_margin=safety_margin,
         reward_scale=reward_scale,
     )

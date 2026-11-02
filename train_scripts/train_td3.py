@@ -15,6 +15,7 @@ import torch
 from agents.td3 import TD3
 from environment import create_env
 from evaluation import evaluate_policy
+from training_log import TrainingLogger, evaluation_metrics
 from utils import ReplayBuffer
 
 
@@ -55,7 +56,6 @@ def main(args):
     env = create_env(
         args.layout_set,
         normalize_obs=args.normalize_obs,
-        safety_margin=args.safety_margin,
         reward_scale=args.reward_scale,
     )
     env.action_space.seed(args.seed)
@@ -107,11 +107,12 @@ def main(args):
         "max_acceleration": env.max_acceleration,
         "goal_radius": env.goal_radius,
         "max_steps": env.max_steps,
-        "safety_margin": env.safety_margin,
         "reward_scale": env.reward_scale,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
+    training_log = TrainingLogger(run_dir)
+    training_log.log_run(config, trainer="sequential")
 
     print(f"State dimension: {state_dim}")
     print(f"Action dimension: {action_dim}")
@@ -156,6 +157,15 @@ def main(args):
                     f"length {episode_steps:4d} | reward {episode_reward:8.3f} | "
                     f"collision {info['collision']} | goal {info['goal_reached']}"
                 )
+                training_log.log(
+                    "episode",
+                    timestep + 1,
+                    episode=episode_num,
+                    reward=episode_reward,
+                    length=episode_steps,
+                    collision=bool(info["collision"]),
+                    goal=bool(info["goal_reached"]),
+                )
                 state, _ = episode_reset(
                     env,
                     args.random_reset_margin,
@@ -168,6 +178,11 @@ def main(args):
 
             if args.log_freq > 0 and (timestep + 1) % args.log_freq == 0:
                 print(f"Step {timestep + 1}: replay_size={replay_buffer.size}")
+                training_log.log(
+                    "progress",
+                    timestep + 1,
+                    replay_size=replay_buffer.size,
+                )
 
             if args.save_freq > 0 and (timestep + 1) % args.save_freq == 0:
                 policy.save(model_path)
@@ -182,7 +197,6 @@ def main(args):
                     random_reset_margin=args.random_reset_margin,
                     random_reset_max_speed=args.random_reset_max_speed,
                     min_start_goal_distance=args.min_start_goal_distance,
-                    safety_margin=args.safety_margin,
                     reward_scale=args.reward_scale,
                 )
                 print(
@@ -197,11 +211,16 @@ def main(args):
                     f"margin_step_fraction={results['margin_step_fraction']:.2%}, "
                     f"mean_min_clearance={results['mean_min_clearance']:.3f} m"
                 )
+                training_log.log(
+                    "eval", timestep + 1, **evaluation_metrics(results)
+                )
                 policy.save(model_path)
     except KeyboardInterrupt:
         policy.save(model_path)
         print(f"Interrupted. Checkpoint saved to: {model_path}")
         return
+    finally:
+        training_log.close()
 
     policy.save(model_path)
     print(f"Training complete. Model saved to: {model_path}")
@@ -256,13 +275,10 @@ def parse_args():
                              "Distances close to the corridor length may be "
                              "infeasible on some layouts, in which case reset "
                              "raises an error")
-    parser.add_argument("--safety-margin", type=float, default=0.35,
-                        help="Clearance (m from vehicle centre to obstacle "
-                             "surface) at which h(s) becomes positive; also "
-                             "defines the margin-violation metrics")
-    parser.add_argument("--reward-scale", type=float, default=50.0,
+    parser.add_argument("--reward-scale", type=float, default=1.0,
                         help="Fixed reward divisor used by the environment; "
-                             "match it across agents so rewards are comparable")
+                             "1.0 uses the unscaled reward. Match it across "
+                             "agents so rewards are comparable")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
     parser.add_argument("--save-freq", type=int, default=5_000,
@@ -289,8 +305,6 @@ def parse_args():
     if (args.min_start_goal_distance is not None
             and args.min_start_goal_distance < 0):
         parser.error("--min-start-goal-distance must be nonnegative")
-    if args.safety_margin <= 0:
-        parser.error("--safety-margin must be positive")
     if args.reward_scale <= 0:
         parser.error("--reward-scale must be positive")
     if args.eval_episodes_per_layout < 1:

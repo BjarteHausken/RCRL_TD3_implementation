@@ -279,8 +279,8 @@ def test_batch_matches_single():
     # so a fixed layout, goal, and start state are shared by both envs.
     state = [10.0, 0.5, 1.0, -0.3]
     goal = [20.0, -1.0]
-    env_a = create_env("one", safety_margin=0.4, reward_scale=50.0)
-    env_b = create_env("one", safety_margin=0.4, reward_scale=50.0)
+    env_a = create_env("one", reward_scale=50.0)
+    env_b = create_env("one", reward_scale=50.0)
     for env in (env_a, env_b):
         env.reset(layout_type="train", layout_index=0, state=state, goal=goal)
 
@@ -478,25 +478,28 @@ def test_variable_layouts():
         )
     print("PASS: step_batch matches step across differing widths")
 
-def test_margin_constraint_and_reward_scale():
+def test_constraint_and_reward_scale():
     # Isolate the wall constraint (no pillars) so the nearest lidar return is
     # exactly the distance to the top wall.
-    margin = 0.4
-    clear_env = create_env("one", safety_margin=margin)
+    clear_env = create_env("one")
     clear_env.pillars = np.zeros((0, 3), dtype=np.float32)
     clear_env.width = 5.0
     clear_env.length = 30.0
     clear_env._update_observation_scale()
+    radius = clear_env.vehicle_radius
 
-    # Clearance = width/2 - y. Inside the margin -> h > 0; outside -> h < 0.
-    for clearance, expected_positive in ((margin - 0.05, True), (margin + 0.05, False)):
+    # Clearance = width/2 - y. Inside the collision radius -> h > 0.
+    for clearance, expected_positive in (
+        (radius - 0.05, True),
+        (radius + 0.05, False),
+    ):
         state = [15.0, 0.0, clear_env.width / 2 - clearance, 0.0]
         clear_env.reset(layout_type="fixed", state=state, goal=[20.0, 0.0])
         lidar = clear_env.get_lidar()
         h = clear_env._get_lidar_constraint(lidar)
-        np.testing.assert_allclose(h, margin - np.min(lidar), atol=1e-9)
+        np.testing.assert_allclose(h, radius - np.min(lidar), atol=1e-9)
         assert (h > 0.0) == expected_positive, (clearance, h)
-    print("PASS: safety margin defines the constraint boundary")
+    print("PASS: vehicle radius defines the constraint boundary")
 
     # The reward divisor must scale both step and goal rewards consistently.
     state = [10.0, 0.0, 0.0, 0.0]
@@ -544,7 +547,7 @@ test_min_start_goal_distance(env)
 test_variable_layouts()
 test_goal(env)
 test_batch_matches_single()
-test_margin_constraint_and_reward_scale()
+test_constraint_and_reward_scale()
 test_back_wall(env)
 #test_velocity_limit(dynamics)
 test_reward_and_constraints(env)

@@ -20,28 +20,12 @@ class CorridorEnvironment(gym.Env):
             goal_radius=0.5,
             max_steps=1000,
             normalize_obs=True,
-            safety_margin=0.35,
             reward_scale=1.0,
     ):
         super().__init__()
-        if safety_margin < vehicle_radius:
-            raise ValueError(
-                "safety_margin must be at least vehicle_radius; otherwise the "
-                "constraint would be satisfied in collision states"
-            )
-        if safety_margin > lidar_range:
-            raise ValueError(
-                "safety_margin must not exceed lidar_range; the sensor could "
-                "not observe the full margin"
-            )
         if reward_scale <= 0:
             raise ValueError("reward_scale must be positive")
         self.normalize_obs = normalize_obs
-        # The state constraint is a signed clearance margin: h(s) <= 0 is
-        # safe, h(s) > 0 means the vehicle is inside the margin. The margin is
-        # deliberately larger than the collision radius so that the
-        # constraint can bind without terminating the episode.
-        self.safety_margin = float(safety_margin)
         # Fixed reward divisor, recorded in config.json so training and
         # evaluation use the same reward scale. It changes the relative scale
         # of the reward and safety terms in the RCRL actor loss.
@@ -397,17 +381,16 @@ class CorridorEnvironment(gym.Env):
         return observation
 
     def _get_lidar_constraint(self, lidar=None):
-        """Signed clearance margin ``h(s) = safety_margin - min(lidar)``.
+        """Signed clearance ``h(s) = vehicle_radius - min(lidar)``.
 
-        ``h(s) <= 0`` is safe and ``h(s) > 0`` means the vehicle footprint is
-        within ``safety_margin`` of a wall or pillar. Because
-        ``safety_margin >= vehicle_radius``, the margin contains the collision
-        boundary, so entering the margin does not necessarily terminate the
-        episode.
+        ``h(s) <= 0`` is safe and ``h(s) > 0`` means the vehicle footprint
+        overlaps a wall or pillar, which is also the collision condition. The
+        constraint boundary is the collision boundary; evaluation may report
+        margin metrics against a wider threshold.
         """
         if lidar is None:
             lidar = self.get_lidar()
-        return self.safety_margin - np.min(lidar)
+        return self.vehicle_radius - np.min(lidar)
 
     def check_collision(self):
         return (self._check_wall_collision() or self._check_pillar_collision())
@@ -769,7 +752,6 @@ def _step_signature(env):
         env.max_acceleration,
         env.max_steps,
         env.normalize_obs,
-        env.safety_margin,
         env.reward_scale,
         env.dynamics.dt,
         env.dynamics.max_velocity,
@@ -955,7 +937,7 @@ def step_batch(envs, actions):
     constraint = np.array(
         [env._current_constraint for env in envs], dtype=np.float64
     )
-    next_constraint = reference.safety_margin - distances.min(axis=1)
+    next_constraint = reference.vehicle_radius - distances.min(axis=1)
 
     new_states = np.stack((new_x, new_x_dot, new_y, new_y_dot), axis=1)
     for i, env in enumerate(envs):

@@ -30,8 +30,14 @@ from environment import create_env
 from evaluation import evaluate_policy
 
 
-def evaluate_run(run_dir, episodes_per_layout):
+def evaluate_run(run_dir, episodes_per_layout, safety_margin=None):
     """Evaluate one run with its own recorded settings.
+
+    ``safety_margin`` is an evaluation-only runtime clearance threshold: the
+    margin metrics use it, and the actor's lidar observations are shortened by
+    the excess over the vehicle radius so the policy keeps that margin. It
+    applies to every run in the comparison and defaults to the vehicle radius,
+    the constraint used in training.
 
     Returns ``(config, results)`` where ``config`` is the run's config with
     the evaluation-relevant settings resolved to the effective values used.
@@ -40,19 +46,30 @@ def evaluate_run(run_dir, episodes_per_layout):
     config = dict(config)
     config["layout_set"] = config.get("layout_set") or "one"
     config["normalize_obs"] = config.get("normalize_obs", True)
-    config["safety_margin"] = config.get("safety_margin", 0.35)
     config["reward_scale"] = config.get("reward_scale", 1.0)
     layout_set = config["layout_set"]
     normalize_obs = config["normalize_obs"]
-    safety_margin = config["safety_margin"]
     reward_scale = config["reward_scale"]
 
     env = create_env(
         layout_set,
         normalize_obs=normalize_obs,
-        safety_margin=safety_margin,
         reward_scale=reward_scale,
     )
+    if safety_margin is None:
+        safety_margin = env.vehicle_radius
+    elif safety_margin < env.vehicle_radius:
+        raise SystemExit(
+            f"--safety-margin must be at least the vehicle radius "
+            f"({env.vehicle_radius} m)"
+        )
+    if safety_margin > env.lidar_range:
+        raise SystemExit(
+            f"--safety-margin must not exceed the lidar range "
+            f"({env.lidar_range} m)"
+        )
+    config["safety_margin"] = safety_margin
+    config["observation_lidar_shift"] = safety_margin - env.vehicle_radius
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
@@ -336,7 +353,7 @@ def save_layout_figure(path, entries, episodes_per_layout):
 
 def warn_on_setting_mismatches(entries):
     """Warn when runs were trained with different evaluation-affecting settings."""
-    for key in ("layout_set", "normalize_obs", "safety_margin"):
+    for key in ("layout_set", "normalize_obs"):
         values = {json.dumps(config.get(key)) for _, config, _ in entries}
         if len(values) > 1:
             print(f"Warning: runs differ in {key!r}; the comparison is not "
@@ -403,7 +420,7 @@ def save_comparison_json(path, entries, episodes_per_layout):
 
 
 def main(names, episodes_per_layout=20, save_json=None, save_png=None,
-         save_layout_png=None):
+         save_layout_png=None, safety_margin=None):
     if len(names) < 2:
         raise SystemExit("Pass at least two run names to compare")
 
@@ -413,7 +430,9 @@ def main(names, episodes_per_layout=20, save_json=None, save_png=None,
         if not os.path.isdir(run_dir):
             raise SystemExit(f"Run directory not found: {run_dir}")
         print(f"=== Evaluating {name} ===")
-        config, results = evaluate_run(run_dir, episodes_per_layout)
+        config, results = evaluate_run(
+            run_dir, episodes_per_layout, safety_margin=safety_margin
+        )
         entries.append((name, config, results))
         num = len(results["rewards"])
         print(
@@ -468,6 +487,17 @@ if __name__ == "__main__":
              "metric) to PATH, for use in presentations",
     )
     parser.add_argument(
+        "--safety-margin",
+        type=float,
+        default=None,
+        help="Optional runtime clearance threshold (m from vehicle centre to "
+             "obstacle surface). The actor's lidar is shortened by the "
+             "excess over the vehicle radius so the policy keeps that margin, "
+             "and the margin-violation metrics use the same threshold. "
+             "Default: the vehicle radius, i.e. the training constraint and "
+             "no observation shift",
+    )
+    parser.add_argument(
         "--save-layout-png",
         metavar="PATH",
         default=None,
@@ -487,4 +517,5 @@ if __name__ == "__main__":
         save_json=args.save_json,
         save_png=args.save_png,
         save_layout_png=args.save_layout_png,
+        safety_margin=args.safety_margin,
     )

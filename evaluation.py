@@ -33,6 +33,28 @@ def _wilson_interval(count, total, z=1.96):
     return max(0.0, centre - half_width), min(1.0, centre + half_width)
 
 
+def _inflate_lidar(observations, shift, reference):
+    """Shorten the lidar part of observations by ``shift`` metres.
+
+    The observation layout is velocity (2), lidar (``num_lidar_rays``), and
+    goal-relative position (2). Shifting the lidar makes the actor perceive
+    every obstacle as ``shift`` metres closer, implementing the runtime
+    safety margin in observation space; the environment and the evaluation
+    metrics keep using the true lidar. Normalized observations store lidar
+    divided by the lidar range, so the shift is scaled the same way.
+    """
+    if shift <= 0.0:
+        return observations
+    if reference.normalize_obs:
+        shift = shift / reference.lidar_range
+    observations = np.array(observations, copy=True)
+    lidar = slice(2, 2 + reference.num_lidar_rays)
+    observations[..., lidar] = np.maximum(
+        observations[..., lidar] - shift, 0.0
+    )
+    return observations
+
+
 def _multiplier_stats(policy, states):
     """Statistics of the RCRL multiplier lambda(s) over visited states."""
     device = next(policy.actor.parameters()).device
@@ -66,7 +88,7 @@ def evaluate_policy(
     random_reset_margin=0.3,
     random_reset_max_speed=1.0,
     min_start_goal_distance=None,
-    safety_margin=0.35,
+    safety_margin=None,
     reward_scale=1.0,
 ):
     """Evaluate a deterministic policy on every layout of ``layout_type``.
@@ -81,10 +103,18 @@ def evaluate_policy(
     (default ``2 * goal_radius``); it should match the value used in training
     so evaluation and training share an episode distribution.
 
-    ``safety_margin`` defines the constraint used for the violation metrics:
-    ``h(s) = safety_margin - min(lidar)`` and ``h(s) > 0`` is a margin
-    violation. ``reward_scale`` must match the environment reward divisor used
-    for training so reported rewards are comparable.
+    ``safety_margin`` optionally sets the clearance threshold (metres from the
+    vehicle centre to the nearest obstacle surface) used for the violation
+    metrics: ``h(s) = safety_margin - min(lidar)`` and ``h(s) > 0`` is a
+    margin violation. At runtime it also acts as an observation-space safety
+    margin: the lidar the actor sees is shortened by
+    ``safety_margin - vehicle_radius``, so the policy reacts to obstacles as
+    if they were that much closer. Collision, termination, rewards, and all
+    metrics still use the true lidar. The threshold defaults to
+    ``vehicle_radius``, the boundary the policy was trained against, which
+    means no observation shift and no extra safety margin. ``reward_scale``
+    must match the environment reward divisor used for training so reported
+    rewards are comparable.
 
     Returns the aggregate metrics ``mean_reward``, ``mean_steps``,
     ``success_rate``, ``collision_rate`` and their 95% Wilson intervals
@@ -115,9 +145,23 @@ def evaluate_policy(
     reference = create_env(
         layout_set,
         normalize_obs=normalize_obs,
-        safety_margin=safety_margin,
         reward_scale=reward_scale,
     )
+    # The environment constrains at the vehicle radius. Evaluation may report
+    # the margin metrics against a wider clearance threshold; the default is
+    # the training boundary itself.
+    if safety_margin is None:
+        safety_margin = reference.vehicle_radius
+    elif safety_margin < reference.vehicle_radius:
+        raise ValueError(
+            "safety_margin must be at least vehicle_radius; otherwise the "
+            "constraint would be satisfied in collision states"
+        )
+    if safety_margin > reference.lidar_range:
+        raise ValueError(
+            "safety_margin must not exceed lidar_range; the sensor could not "
+            "observe the full margin"
+        )
     if min_start_goal_distance is None:
         min_start_goal_distance = 2 * reference.goal_radius
     layouts = (
@@ -135,7 +179,6 @@ def evaluate_policy(
         env = create_env(
             layout_set,
             normalize_obs=normalize_obs,
-            safety_margin=safety_margin,
             reward_scale=reward_scale,
         )
         states[episode_index], _ = env.reset(
@@ -164,7 +207,11 @@ def evaluate_policy(
     max_h = np.full(num_episodes, -np.inf)
     min_clearance = np.full(num_episodes, np.inf)
     clearance_sum = np.zeros(num_episodes)
-    constraint_margin = reference.safety_margin
+    constraint_margin = safety_margin
+    # Runtime safety margin as observation-space obstacle inflation. Zero by
+    # default (threshold = vehicle radius), so training and plain evaluation
+    # see the true lidar.
+    lidar_shift = safety_margin - reference.vehicle_radius
 
     # RCRL policies: sample visited states (every fifth batch step, up to a
     # cap) so the multiplier lambda(s) can be measured on the same visited
@@ -181,7 +228,9 @@ def evaluate_policy(
         active_indices = np.flatnonzero(active)
         with torch.inference_mode():
             observations = torch.as_tensor(
-                states[active_indices], dtype=torch.float32, device=device
+                _inflate_lidar(states[active_indices], lidar_shift, reference),
+                dtype=torch.float32,
+                device=device,
             )
             actions = policy.actor(observations).cpu().numpy()
 
@@ -201,19 +250,24 @@ def evaluate_policy(
             lambda_states.append(chunk)
             lambda_state_count += chunk.shape[0]
 
+        # The environment reports h(s) = vehicle_radius - min(lidar), so the
+        # clearance to the nearest obstacle is vehicle_radius - h(s).
         constraint = info["constraint"]
         next_constraint = info["next_constraint"]
-        margin_steps[active_indices] += constraint > 0.0
-        clearance_sum[active_indices] += constraint_margin - constraint
+        clearance = reference.vehicle_radius - constraint
+        next_clearance = reference.vehicle_radius - next_constraint
+        margin_steps[active_indices] += clearance < constraint_margin
+        clearance_sum[active_indices] += clearance
         max_h[active_indices] = np.maximum(
-            max_h[active_indices], np.maximum(constraint, next_constraint)
+            max_h[active_indices],
+            np.maximum(
+                constraint_margin - clearance,
+                constraint_margin - next_clearance,
+            ),
         )
         min_clearance[active_indices] = np.minimum(
             min_clearance[active_indices],
-            np.minimum(
-                constraint_margin - constraint,
-                constraint_margin - next_constraint,
-            ),
+            np.minimum(clearance, next_clearance),
         )
 
         # Record each episode's outcome at its first terminal or truncated
@@ -244,6 +298,8 @@ def evaluate_policy(
 
     return {
         "lambda_stats": lambda_stats,
+        "safety_margin": float(safety_margin),
+        "observation_lidar_shift": float(lidar_shift),
         "mean_reward": float(episode_reward.mean()),
         "mean_steps": float(episode_steps.mean()),
         "success_rate": float(successes.mean()),

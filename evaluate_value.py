@@ -591,7 +591,7 @@ class ValueExplorer:
         self.velocity_label.set_text("v" if speed > 1e-6 else "")
 
         lidar = self.env.lidar_at(position)
-        raw_constraint = self.env.safety_margin - float(np.min(lidar))
+        raw_constraint = self.env.vehicle_radius - float(np.min(lidar))
         value, action = evaluate_states(
             self.policy,
             observation_batch(self.env, position, velocity, self.goal),
@@ -676,7 +676,6 @@ def main(
     env = create_env(
         layout_set,
         normalize_obs=normalize_obs,
-        safety_margin=config.get("safety_margin", 0.35),
         reward_scale=config.get("reward_scale", 1.0),
     )
 

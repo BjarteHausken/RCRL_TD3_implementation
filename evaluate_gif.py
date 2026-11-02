@@ -21,10 +21,11 @@ from agents.td3 import TD3
 from agents.rcrl_td3 import RCRLTD3
 from environment import create_env
 from evaluate import agent_type_from_config, load_config
+from evaluation import _inflate_lidar
 
 
 def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
-               output=None, gif_max_width=900):
+               output=None, gif_max_width=900, safety_margin=None):
     config = load_config(run_dir)
     agent_type = agent_type_from_config(config, run_dir)
     model_path = os.path.join(run_dir, agent_type)
@@ -32,9 +33,17 @@ def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
     env = create_env(
         layout_set,
         normalize_obs=normalize_obs,
-        safety_margin=config.get("safety_margin", 0.35),
         reward_scale=config.get("reward_scale", 1.0),
     )
+    if safety_margin is None:
+        safety_margin = env.vehicle_radius
+    elif not env.vehicle_radius <= safety_margin <= env.lidar_range:
+        raise ValueError(
+            f"--safety-margin must be between the vehicle radius "
+            f"({env.vehicle_radius} m) and the lidar range "
+            f"({env.lidar_range} m)"
+        )
+    lidar_shift = safety_margin - env.vehicle_radius
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -98,8 +107,9 @@ def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
     frames = []
     episode_reward = 0.0
     while True:
-        # IMPORTANT: No exploration noise during evaluation
-        action = policy.select_action(state)
+        # IMPORTANT: No exploration noise during evaluation. The optional
+        # safety margin is applied as observation-space obstacle inflation.
+        action = policy.select_action(_inflate_lidar(state, lidar_shift, env))
         state, reward, terminated, truncated, info = env.step(action)
         episode_reward += reward
 
@@ -175,6 +185,15 @@ if __name__ == "__main__":
         help="Disable observation scaling",
     )
     parser.add_argument(
+        "--safety-margin",
+        type=float,
+        default=None,
+        help="Optional runtime clearance threshold (m from vehicle centre to "
+             "obstacle surface); the actor's lidar is shortened by the excess "
+             "over the vehicle radius. Default: the vehicle radius, i.e. no "
+             "observation shift",
+    )
+    parser.add_argument(
         "--output",
         metavar="PATH",
         default=None,
@@ -205,5 +224,6 @@ if __name__ == "__main__":
         args.normalize_obs,
         args.output,
         args.gif_max_width,
+        args.safety_margin,
     )
     print(f"Saved gif: {output}")

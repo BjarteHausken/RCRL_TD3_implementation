@@ -38,6 +38,7 @@ from train_scripts.train_rcrl_td3 import (
     evaluate_policy,
     set_seed,
 )
+from training_log import TrainingLogger, evaluation_metrics, lambda_metrics
 from utils import ReplayBufferRCRLTD3Torch
 
 
@@ -50,7 +51,6 @@ def main(args):
         create_env(
             args.layout_set,
             normalize_obs=args.normalize_obs,
-            safety_margin=args.safety_margin,
             reward_scale=args.reward_scale,
         )
         for _ in range(args.num_envs)
@@ -113,11 +113,14 @@ def main(args):
         "max_acceleration": envs[0].max_acceleration,
         "goal_radius": envs[0].goal_radius,
         "max_steps": envs[0].max_steps,
-        "safety_margin": envs[0].safety_margin,
         "reward_scale": envs[0].reward_scale,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
+    training_log = TrainingLogger(run_dir)
+    training_log.log_run(
+        config, trainer="vectorized", num_envs=args.num_envs
+    )
 
     print(f"State dimension: {state_dim}")
     print(f"Action dimension: {action_dim}")
@@ -249,11 +252,13 @@ def main(args):
                 next_log += args.log_freq
                 elapsed = time.perf_counter() - start_time
                 lambda_stats = policy.lambda_stats(observations)
+                mean_h_pred = policy.policy_safety_value(observations)
+                window_count = len(window_rewards)
                 message = (
                     f"Step {env_steps_done}: replay_size={replay_buffer.size}, "
                     f"mean_lambda={lambda_stats['mean']:.4f}, "
                     f"max_lambda={lambda_stats['max']:.4f}, "
-                    f"mean_h_pred={policy.policy_safety_value(observations):+.4f}"
+                    f"mean_h_pred={mean_h_pred:+.4f}"
                 )
                 if "cap_fraction" in lambda_stats:
                     message += (
@@ -261,19 +266,40 @@ def main(args):
                         f"lambda_at_floor={lambda_stats['floor_fraction']:.1%}"
                     )
                 message += f", {env_steps_done / elapsed:.0f} steps/s"
-                if window_rewards:
+                if window_count:
                     message += (
-                        f" | episodes={len(window_rewards)}, "
+                        f" | episodes={window_count}, "
                         f"mean_reward={np.mean(window_rewards):.3f}, "
                         f"mean_length={np.mean(window_lengths):.1f}, "
-                        f"collision_rate={window_collisions / len(window_rewards):.1%}, "
-                        f"goal_rate={window_goals / len(window_rewards):.1%}, "
+                        f"collision_rate={window_collisions / window_count:.1%}, "
+                        f"goal_rate={window_goals / window_count:.1%}, "
                         f"margin_violation_rate="
-                        f"{window_margin_violations / len(window_rewards):.1%}, "
+                        f"{window_margin_violations / window_count:.1%}, "
                         f"margin_step_fraction="
                         f"{window_violation_steps / max(window_steps, 1):.2%}"
                     )
                 print(message)
+                log_metrics = {
+                    "replay_size": replay_buffer.size,
+                    "mean_h_pred": mean_h_pred,
+                    "steps_per_second": env_steps_done / elapsed,
+                }
+                log_metrics.update(lambda_metrics(lambda_stats))
+                if window_count:
+                    log_metrics.update(
+                        episodes=window_count,
+                        mean_reward=float(np.mean(window_rewards)),
+                        mean_length=float(np.mean(window_lengths)),
+                        collision_rate=window_collisions / window_count,
+                        goal_rate=window_goals / window_count,
+                        margin_violation_rate=(
+                            window_margin_violations / window_count
+                        ),
+                        margin_step_fraction=(
+                            window_violation_steps / max(window_steps, 1)
+                        ),
+                    )
+                training_log.log("progress", env_steps_done, **log_metrics)
                 window_rewards.clear()
                 window_lengths.clear()
                 window_collisions = 0
@@ -297,7 +323,6 @@ def main(args):
                     random_reset_margin=args.random_reset_margin,
                     random_reset_max_speed=args.random_reset_max_speed,
                     min_start_goal_distance=args.min_start_goal_distance,
-                    safety_margin=args.safety_margin,
                     reward_scale=args.reward_scale,
                 )
                 print(
@@ -312,11 +337,16 @@ def main(args):
                     f"margin_step_fraction={results['margin_step_fraction']:.2%}, "
                     f"mean_min_clearance={results['mean_min_clearance']:.3f} m"
                 )
+                training_log.log(
+                    "eval", env_steps_done, **evaluation_metrics(results)
+                )
                 policy.save(model_path)
     except KeyboardInterrupt:
         policy.save(model_path)
         print(f"Interrupted. Checkpoint saved to: {model_path}")
         return
+    finally:
+        training_log.close()
 
     policy.save(model_path)
     print(f"Training complete. Model saved to: {model_path}")
@@ -383,13 +413,14 @@ def parse_args():
              "--initial-lambda and not updated during training",
     )
     parser.add_argument("--max-lambda", type=float, default=100.0,
-                        help="Upper multiplier bound. Scaled with the reward "
-                             "divisor: 2.0 at --reward-scale 50 is equivalent "
-                             "to 100 with unscaled rewards")
+                        help="Upper multiplier bound. With the default "
+                             "--reward-scale 1.0 this is the paper's unscaled "
+                             "bound; at --reward-scale 50 use 2.0 instead")
     parser.add_argument("--initial-lambda", type=float, default=10.0,
-                        help="Initial lambda; with normalized rewards "
-                             "(default --reward-scale 50) 0.1 keeps the "
-                             "safety term comparable to the reward term")
+                        help="Initial lambda. With the default "
+                             "--reward-scale 1.0 this keeps the safety term "
+                             "comparable to the reward term; at "
+                             "--reward-scale 50 use 0.1 instead")
     parser.add_argument("--min-lambda", type=float, default=0.0,
                         help="Floor of the statewise lambda(s) network. The "
                              "dual drives lambda to zero on a safe-dominated "
@@ -407,15 +438,11 @@ def parse_args():
                              "Distances close to the corridor length may be "
                              "infeasible on some layouts, in which case reset "
                              "raises an error")
-    parser.add_argument("--safety-margin", type=float, default=0.20,
-                        help="Clearance (m from vehicle centre to obstacle "
-                             "surface) at which h(s) becomes positive; must "
-                             "be at least vehicle_radius (0.2) and is "
-                             "independent of collision termination")
     parser.add_argument("--reward-scale", type=float, default=1.0,
                         help="Fixed reward divisor used by the environment; "
-                             "50 puts the goal bonus at 1.0 so reward and "
-                             "safety terms have comparable scale")
+                             "1.0 uses the unscaled reward, while larger "
+                             "values shrink returns to keep reward and safety "
+                             "terms comparable in the actor loss")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
     parser.add_argument("--save-freq", type=int, default=5_000,
@@ -457,8 +484,6 @@ def parse_args():
     if (args.min_start_goal_distance is not None
             and args.min_start_goal_distance < 0):
         parser.error("--min-start-goal-distance must be nonnegative")
-    if args.safety_margin <= 0:
-        parser.error("--safety-margin must be positive")
     if args.reward_scale <= 0:
         parser.error("--reward-scale must be positive")
     if args.eval_episodes_per_layout < 1:

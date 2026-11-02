@@ -87,6 +87,9 @@ def save_evaluation_json(path, results, config, run_dir, layout_set,
         "normalize_obs": bool(normalize_obs),
         "episodes_per_layout": int(results["episodes_per_layout"]),
         "safety_margin": float(safety_margin),
+        "observation_lidar_shift": float(
+            results.get("observation_lidar_shift", 0.0)
+        ),
         "reward_scale": float(reward_scale),
         "random_reset_margin": config.get("random_reset_margin", 0.3),
         "random_reset_max_speed": config.get("random_reset_max_speed", 1.0),
@@ -145,20 +148,36 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
          save_json=None):
     config = load_config(run_dir)
 
-    # The constraint margin and reward divisor are properties of the run.
-    # Checkpoints trained before these were recorded fall back to the
-    # environment default margin and unscaled rewards.
-    if safety_margin is None:
-        safety_margin = config.get("safety_margin", 0.35)
+    # The reward divisor is a property of the run. Checkpoints trained before
+    # it was recorded fall back to unscaled rewards. The safety margin is an
+    # optional evaluation-only threshold for the margin metrics; it defaults
+    # to the vehicle radius, the boundary the policy was trained against.
     if reward_scale is None:
         reward_scale = config.get("reward_scale", 1.0)
 
     env = create_env(
         layout_set,
         normalize_obs=normalize_obs,
-        safety_margin=safety_margin,
         reward_scale=reward_scale,
     )
+    if safety_margin is None:
+        safety_margin = env.vehicle_radius
+    elif safety_margin < env.vehicle_radius:
+        raise ValueError(
+            f"--safety-margin must be at least the vehicle radius "
+            f"({env.vehicle_radius} m)"
+        )
+    if safety_margin > env.lidar_range:
+        raise ValueError(
+            f"--safety-margin must not exceed the lidar range "
+            f"({env.lidar_range} m)"
+        )
+    if safety_margin > env.vehicle_radius:
+        print(
+            f"Runtime safety margin: actor lidar shortened by "
+            f"{safety_margin - env.vehicle_radius:.3f} m "
+            f"(clearance threshold {safety_margin:.3f} m)"
+        )
 
     # The sampled episode distribution is a property of the run: use the
     # distance recorded at training time, falling back to two goal radii for
@@ -283,8 +302,12 @@ if __name__ == "__main__":
         "--safety-margin",
         type=float,
         default=None,
-        help="Override the safety margin recorded in config.json for the "
-             "margin-violation metrics",
+        help="Optional runtime clearance threshold (m from vehicle centre to "
+             "obstacle surface). The actor's lidar is shortened by the "
+             "excess over the vehicle radius so the policy keeps that margin, "
+             "and the margin-violation metrics use the same threshold. "
+             "Default: the vehicle radius, i.e. the training constraint and "
+             "no observation shift",
     )
     parser.add_argument(
         "--reward-scale",
