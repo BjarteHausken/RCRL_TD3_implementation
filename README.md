@@ -38,6 +38,8 @@ evaluation_scripts/
   evaluate_visual.py         Rendered single-episode evaluation
   evaluate_gif.py            Headless single-episode gif rendering
   evaluate_value.py          Interactive reachability-value explorer (RCRL-TD3)
+  evaluate_feasibility.py    Learned feasible set vs actual largest feasible set
+  feasibility.py             Ground-truth viability kernel and set metrics
   evaluation.py              Batched evaluator used by the trainers and scripts
 ```
 
@@ -233,6 +235,33 @@ python evaluation_scripts/evaluate_value.py --name my_rcrl_run --save value.png
 The speed and heading sliders choose the velocity slice: every position on the map is evaluated at that same velocity. The goal sliders move the goal, and the layout slider switches pillar sets (`--layout-type train|test|val`, default `test`). Left-clicking the map pins a state marker, whose value, policy action, and raw constraint `h(s)` are shown in the upper-left corner; hovering reads the value under the cursor. The color scale rescales to each slice unless `--vmax` fixes a symmetric range. `--save` renders one headless figure instead of opening a window.
 
 The script requires a checkpoint whose `config.json` records `"agent": "rcrl_td3"`; plain TD3 runs have no safety critic. A blue or red cell is a prediction of the learned critic, not a runtime safety guarantee (see [Important limits](#important-limits)).
+
+### Learned vs actual largest feasible set
+
+`evaluation_scripts/evaluate_feasibility.py` compares the learned feasible set with the actual largest feasible set on the same positions and velocity slice:
+
+```bash
+python evaluation_scripts/evaluate_feasibility.py --name my_rcrl_run
+python evaluation_scripts/evaluate_feasibility.py --name my_rcrl_run \
+    --layout-indices 0 1 --slices 0,0 1,0 0,1 --goals-per-layout 8 \
+    --save-json results/feasibility.json --save-png results/feasibility.png
+```
+
+- **Learned feasible set:** `{s : V_h(s) <= 0}`, the safety value used by the policy (same quantity as the [reachability-value explorer](#reachability-value-explorer)).
+- **Actual largest feasible set:** the viability kernel — the largest set of states from which *some* control sequence keeps the vehicle collision-free forever, computed from the environment's exact double-integrator dynamics and collision geometry, with no policy involved. Because the zero action is admissible on a static map, it includes every state that can brake to a safe standstill; it also keeps states that stay safe by moving, so stopping is not assumed.
+
+The kernel is the fixed point of `K_0 = collision-free states`, `K_{k+1} = K_k ∩ {s : ∃u, f(s,u) ∈ K_k}` on an `(x, y, vx, vy)` grid (`evaluation_scripts/feasibility.py`). The default velocity spacing is one full-braking step, `dt * max_acceleration` (0.2 m/s); a coarser grid rounds deceleration back to the same node and falsely declares high-speed states infeasible. Positions where the vehicle footprint overlaps an obstacle are excluded from both sets.
+
+Because observations are goal-relative, `V_h` depends on the goal even though feasibility does not, so the learned maps and metrics are averaged over `--goals-per-layout` goals sampled from the training distribution. The reported metrics, restricted to collision-free grid positions, are:
+
+- `IoU` — intersection over union of the two feasible sets;
+- `false-safe` — share of actually infeasible states the learned value calls safe (the dangerous error);
+- `false-unsafe` — share of actually feasible states it calls unsafe (the over-cautious error);
+- `true feasible` / `learned feasible` — share of free positions each set claims.
+
+With no `--save-png`, only the table prints. The figure has one row per velocity slice and three panels: learned set, viability kernel, and disagreement (learned-feasible-but-infeasible in red, learned-infeasible-but-feasible in blue). The map drawn is the first sampled goal; the row metrics are averaged over all sampled goals. `--position-spacing` (default 0.2 m), `--velocity-spacing`, `--action-levels` (default 3, i.e. `{-a, 0, +a}` per axis), and `--max-iterations` control solver accuracy; `--layout-type`, `--layout-indices`, and `--seed` select layouts and goals. A layout with a 148×32×31×31 grid converges in about 15 iterations and takes roughly 30 s on CPU. Only RCRL-TD3 checkpoints have a safety value.
+
+Note the asymmetry: the kernel is the maximal set for *some* controller, while `V_h` is conditioned on the trained policy. The safety critic can only learn from states the policy visits, so an untrained or over-cautious policy shows mostly `false-unsafe` error, and a state outside the kernel is only truly unsolvable if no control sequence can save it — the policy may still fail inside the kernel.
 
 ## Manual control and tests
 
