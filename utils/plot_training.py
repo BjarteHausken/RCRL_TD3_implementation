@@ -5,13 +5,21 @@ one or more runs and draws training reward/length, validation success and
 collision with confidence bands, and RCRL multiplier/safety diagnostics.
 
 Usage:
-    python plot_training.py run_a run_b
-    python plot_training.py run_a --smooth 50 --save results/run_a_curves.png
+    python utils/plot_training.py run_a run_b
+    python utils/plot_training.py run_a --smooth 50 --save results/run_a_curves.png
 """
 
 import argparse
 import json
 import os
+import sys
+
+# Allow ``python utils/plot_training.py`` from the repository root: the script
+# directory is on sys.path, not the repository root, so add the root explicitly
+# before importing the project's packages.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import matplotlib
 matplotlib.use("Agg")  # must be set before pyplot, like the other headless scripts
@@ -20,7 +28,7 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
 import numpy as np
 
-from training_log import DEFAULT_LOG_NAME
+from utils.training_log import DEFAULT_LOG_NAME
 
 
 DEFAULT_SAVE = os.path.join("results", "training_curves.png")

@@ -1,6 +1,11 @@
 import argparse
 import time
 import os
+import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import matplotlib
 from PIL import Image
@@ -19,8 +24,8 @@ def main(run_dir, test_layout="random", layout_set="one",
     from agents.td3 import TD3
     from agents.rcrl_td3 import RCRLTD3
     from environment import create_env
-    from evaluate import agent_type_from_config, load_config
-    from evaluation import _inflate_lidar
+    from evaluation_scripts.evaluate import agent_type_from_config, load_config
+    from evaluation_scripts.evaluation import _inflate_lidar
 
     config = load_config(run_dir)
     agent_type = agent_type_from_config(config, run_dir)

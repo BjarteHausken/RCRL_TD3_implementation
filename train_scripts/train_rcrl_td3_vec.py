@@ -38,7 +38,7 @@ from train_scripts.train_rcrl_td3 import (
     evaluate_policy,
     set_seed,
 )
-from training_log import TrainingLogger, evaluation_metrics, lambda_metrics
+from utils.training_log import TrainingLogger, evaluation_metrics, lambda_metrics
 from utils import ReplayBufferRCRLTD3Torch
 
 

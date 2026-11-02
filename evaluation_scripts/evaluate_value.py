@@ -15,9 +15,9 @@ exactly: velocity, lidar distances, and goal-relative coordinates, scaled by
 ``env.obs_scale`` when the checkpoint was trained with ``--normalize-obs``.
 
 Usage:
-    python evaluate_value.py --name my_rcrl_run
-    python evaluate_value.py --name my_rcrl_run --layout-index 3 --speed 1.5
-    python evaluate_value.py --name my_rcrl_run --save value.png
+    python evaluation_scripts/evaluate_value.py --name my_rcrl_run
+    python evaluation_scripts/evaluate_value.py --name my_rcrl_run --layout-index 3 --speed 1.5
+    python evaluation_scripts/evaluate_value.py --name my_rcrl_run --save value.png
 
 Hover the map to read the value at the cursor; left click pins the state
 marker whose value, raw constraint, and policy action are shown in the
@@ -26,7 +26,12 @@ upper-left corner.
 
 import argparse
 import os
+import sys
 import time
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import torch
@@ -662,7 +667,7 @@ def main(
 
     from agents.rcrl_td3 import RCRLTD3
     from environment import create_env
-    from evaluate import agent_type_from_config, load_config
+    from evaluation_scripts.evaluate import agent_type_from_config, load_config
 
     config = load_config(run_dir)
     agent_type = agent_type_from_config(config, run_dir)

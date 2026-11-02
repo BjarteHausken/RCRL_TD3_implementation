@@ -1,13 +1,21 @@
 import argparse
 import json
 import os
+import sys
+
+# Allow ``python evaluation_scripts/evaluate.py`` from the repository root:
+# the script directory is on sys.path, not the repository root, so add the
+# root explicitly before importing the project's packages.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 
 from agents.td3 import TD3
 from agents.rcrl_td3 import RCRLTD3
 from environment import create_env
-from evaluation import evaluate_policy
+from evaluation_scripts.evaluation import evaluate_policy
 
 
 def load_config(run_dir):

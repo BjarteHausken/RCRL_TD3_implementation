@@ -21,21 +21,24 @@ environment/
   manual_control.py          Manual keyboard driving for environment sanity checks
 layouts/                     Layout sets: <set>_{train,test,validation}.npy
 models/                      Training runs as <name>/ (checkpoints + config.json + training_log.jsonl)
-utils.py                     Replay buffers (plain, and RCRL with h/h')
-training_log.py              Structured JSONL training metrics written by every trainer
+utils/                       Shared support modules
+  replay_buffer.py           Replay buffers (plain, and RCRL with h/h')
+  training_log.py            Structured JSONL training metrics written by every trainer
+  plot_training.py           Training-curve plots from the JSONL logs
+  test.py                    Environment checks (gymnasium check_env, margins)
 train.sh                     Wrapper: ./train.sh <rcrl|rcrl-vec|td3|td3-vec> [trainer flags]
 train_scripts/
   train_rcrl_td3.py          Trainer for the RCRL agent
   train_rcrl_td3_vec.py      Vectorized RCRL trainer (parallel envs, device buffer)
   train_td3.py               Trainer for the plain TD3 baseline
   train_td3_vec.py           Vectorized TD3 trainer (parallel envs, device buffer)
-evaluate.py                  Headless evaluation over all test layouts
-evaluate_visual.py           Rendered single-episode evaluation
-evaluate_gif.py              Headless single-episode gif rendering
-evaluate_value.py            Interactive reachability-value explorer (RCRL-TD3)
-evaluation.py                Batched evaluation used by trainers and evaluate.py
-plot_training.py             Training-curve plots from the JSONL logs
-test.py                      Environment checks (gymnasium check_env, margins)
+evaluation_scripts/
+  evaluate.py                Headless evaluation over all test layouts
+  evaluate_compare.py        Side-by-side comparison of several runs
+  evaluate_visual.py         Rendered single-episode evaluation
+  evaluate_gif.py            Headless single-episode gif rendering
+  evaluate_value.py          Interactive reachability-value explorer (RCRL-TD3)
+  evaluation.py              Batched evaluator used by the trainers and scripts
 ```
 
 ## Requirements
@@ -47,7 +50,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Layout data is not tracked. Before training, evaluating, or running `test.py`, generate the default layout set:
+Layout data is not tracked. Before training, evaluating, or running `utils/test.py`, generate the default layout set:
 
 ```bash
 python -m environment.layouts.generate_layouts --name one
@@ -165,8 +168,8 @@ Every trainer also writes `models/<name>/training_log.jsonl`, one JSON object pe
 Plot one or more runs (the default output is `results/training_curves.png`):
 
 ```bash
-python plot_training.py my_rcrl_run
-python plot_training.py my_rcrl_run my_td3_run --smooth 50 \
+python utils/plot_training.py my_rcrl_run
+python utils/plot_training.py my_rcrl_run my_td3_run --smooth 50 \
   --save results/compare_curves.png
 ```
 
@@ -177,14 +180,14 @@ The figure has eight panels: training reward and episode length, validation succ
 Evaluate a checkpoint on all test layouts:
 
 ```bash
-python evaluate.py --name my_rcrl_run
-python evaluate.py --name my_rcrl_run --save-json results/my_rcrl_run.json
-python evaluate_visual.py --name my_rcrl_run
+python evaluation_scripts/evaluate.py --name my_rcrl_run
+python evaluation_scripts/evaluate.py --name my_rcrl_run --save-json results/my_rcrl_run.json
+python evaluation_scripts/evaluate_visual.py --name my_rcrl_run
 ```
 
 `--save-json PATH` writes the full report — run metadata, aggregate metrics, per-layout metrics, and the per-episode arrays — as JSON. Per-episode arrays use the same seeded start/goal pairs for every checkpoint of a layout set, so reports can be joined by layout and episode index for paired comparisons across runs. The file also embeds the run's `config.json` for provenance.
 
-`evaluate.py` reports per-layout outcomes and the same aggregates as the in-training evaluation: mean reward, mean steps, success rate, collision rate, and margin metrics. Each test layout is run for `--eval-episodes-per-layout` episodes (default 20), each with a freshly sampled feasible start and goal — the same randomized regime as training. Episodes are seeded by index, so evaluation runs are reproducible, and rates are reported with 95% Wilson confidence intervals.
+`evaluation_scripts/evaluate.py` reports per-layout outcomes and the same aggregates as the in-training evaluation: mean reward, mean steps, success rate, collision rate, and margin metrics. Each test layout is run for `--eval-episodes-per-layout` episodes (default 20), each with a freshly sampled feasible start and goal — the same randomized regime as training. Episodes are seeded by index, so evaluation runs are reproducible, and rates are reported with 95% Wilson confidence intervals.
 
 The margin metrics measure constraint satisfaction separately from collision, using the run's `reward_scale` from `config.json` (override with `--reward-scale`) and an evaluation-only clearance threshold. That threshold is set with `--safety-margin` and defaults to the vehicle radius, i.e. the constraint used in training:
 
@@ -201,19 +204,19 @@ Evaluation is batched: all episodes are stepped in parallel through `environment
 
 The evaluation scripts read the `agent` field in the run's `config.json` to select the agent type (TD3 or RCRL-TD3), so `--agent` is not needed; a run whose `config.json` does not record a valid agent type cannot be evaluated. For RCRL-TD3 the scripts also reconstruct the exact agent (`--multiplier`, `--initial-lambda`, `--max-lambda`, and `--min-lambda`), so a checkpoint loads against the same network structure and multiplier parameterisation it was saved with. The evaluation sampling margin, speed bound, and minimum start-goal distance are also read from the run's `config.json` (the distance can be overridden with `--min-start-goal-distance`).
 
-`evaluate_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout. Both it and `evaluate_gif.py` accept `--safety-margin`, which applies the same runtime observation shift as `evaluate.py` so the rendered episode shows the margin-aware behaviour.
+`evaluation_scripts/evaluate_visual.py` renders a single episode and additionally accepts `--test-layout` (`random` or a zero-based index) to choose the test layout. Both it and `evaluation_scripts/evaluate_gif.py` accept `--safety-margin`, which applies the same runtime observation shift as `evaluation_scripts/evaluate.py` so the rendered episode shows the margin-aware behaviour.
 
-`evaluate_gif.py` renders one episode headlessly and writes only a gif, with no window and no evaluation report:
+`evaluation_scripts/evaluate_gif.py` renders one episode headlessly and writes only a gif, with no window and no evaluation report:
 
 ```bash
-python evaluate_gif.py --name my_rcrl_run --test-layout 3
+python evaluation_scripts/evaluate_gif.py --name my_rcrl_run --test-layout 3
 ```
 
 The default output is `gifs/<name>_<layout-set>_layout<INDEX>.gif`; use `--output PATH` to choose another path and `--gif-max-width` to bound the frame size. The episode is seeded by layout index, so the same model and layout always reproduce the same start, goal, and animation.
 
 ### Reachability-value explorer
 
-`evaluate_value.py` plots the learned RCRL reachability value for a policy on the corridor, at a chosen velocity:
+`evaluation_scripts/evaluate_value.py` plots the learned RCRL reachability value for a policy on the corridor, at a chosen velocity:
 
 ```text
 V_h(s) = Q_h(s, pi(s))
@@ -222,9 +225,9 @@ V_h(s) = Q_h(s, pi(s))
 where `Q_h` is the online safety critic and `pi` is the deterministic actor. The map uses a diverging scale centered on zero: negative values (predicted safe) run blue, positive values (predicted unsafe) run red, zero is neutral gray, and cells whose vehicle footprint overlaps a wall or pillar are left blank. The observation at every map cell is built exactly as `CorridorEnvironment._get_observation` builds it, including the lidar cast at that cell and the observation normalization recorded in the checkpoint.
 
 ```bash
-python evaluate_value.py --name my_rcrl_run
-python evaluate_value.py --name my_rcrl_run --layout-index 3 --speed 1.5 --heading 45
-python evaluate_value.py --name my_rcrl_run --save value.png
+python evaluation_scripts/evaluate_value.py --name my_rcrl_run
+python evaluation_scripts/evaluate_value.py --name my_rcrl_run --layout-index 3 --speed 1.5 --heading 45
+python evaluation_scripts/evaluate_value.py --name my_rcrl_run --save value.png
 ```
 
 The speed and heading sliders choose the velocity slice: every position on the map is evaluated at that same velocity. The goal sliders move the goal, and the layout slider switches pillar sets (`--layout-type train|test|val`, default `test`). Left-clicking the map pins a state marker, whose value, policy action, and raw constraint `h(s)` are shown in the upper-left corner; hovering reads the value under the cursor. The color scale rescales to each slice unless `--vmax` fixes a symmetric range. `--save` renders one headless figure instead of opening a window.
@@ -235,10 +238,10 @@ The script requires a checkpoint whose `config.json` records `"agent": "rcrl_td3
 
 ```bash
 python -m environment.manual_control   # drive manually (needs a display)
-python test.py                                   # check_env, random-state margins, goal termination/reward
+python utils/test.py                              # check_env, random-state margins, goal termination/reward
 ```
 
-`test.py` is an exploratory script (not a pytest suite). Re-run it when changing environment behavior.
+`utils/test.py` is an exploratory script (not a pytest suite). Re-run it when changing environment behavior.
 
 ## Constraint convention
 
@@ -353,7 +356,7 @@ One `env.reset(...)` call does all of the following, in this order:
 2. sample a **start state** via `CorridorEnvironment.sample_random_state` on that layout — a position with `vehicle_radius + margin` clearance from the walls and `pillar_radius + vehicle_radius + margin` clearance from every pillar, and a velocity drawn uniformly from a disk of radius `--random-reset-max-speed`, and
 3. sample a **goal** the same way (with zero velocity), resampled until it is at least `--min-start-goal-distance` away from the start (default `2 * goal_radius`, 1.0 m).
 
-Sampling after the layout is selected guarantees the start and goal are feasible for the layout the episode actually runs on. With a large minimum distance, some layouts admit few or no valid goal positions for a given start; the goal resampling is bounded and `reset` raises a `RuntimeError` instead of looping forever when no valid goal is found within 1000 attempts. The resolved distance is recorded in `config.json`, and evaluation uses it unless `evaluate.py --min-start-goal-distance` overrides it; checkpoints without the field fall back to two goal radii.
+Sampling after the layout is selected guarantees the start and goal are feasible for the layout the episode actually runs on. With a large minimum distance, some layouts admit few or no valid goal positions for a given start; the goal resampling is bounded and `reset` raises a `RuntimeError` instead of looping forever when no valid goal is found within 1000 attempts. The resolved distance is recorded in `config.json`, and evaluation uses it unless `evaluation_scripts/evaluate.py --min-start-goal-distance` overrides it; checkpoints without the field fall back to two goal radii.
 
 Full RCRL training runs from step 0 — there is no separate exploration or warm-up phase; exploration comes from the per-step action noise (`--expl-noise`).
 
@@ -363,7 +366,7 @@ Full RCRL training runs from step 0 — there is no separate exploration or warm
 | `--random-reset-max-speed` | `1.0` | maximum speed (m/s) of the sampled start velocity |
 | `--min-start-goal-distance` | `2 * goal_radius` | minimum Euclidean start-goal distance (m) for sampled episodes; infeasible values raise an error at reset |
 
-Evaluation follows the same regime: `evaluate.py` runs `--eval-episodes-per-layout` episodes (default 20) per test layout, each with a freshly sampled start and goal and seeded by episode index. `evaluate_visual.py` and `evaluate_gif.py` render one episode per layout, seeded by layout index.
+Evaluation follows the same regime: `evaluation_scripts/evaluate.py` runs `--eval-episodes-per-layout` episodes (default 20) per test layout, each with a freshly sampled start and goal and seeded by episode index. `evaluation_scripts/evaluate_visual.py` and `evaluation_scripts/evaluate_gif.py` render one episode per layout, seeded by layout index.
 
 ## Important limits
 
@@ -373,7 +376,7 @@ The actor has no runtime safety filter. It returns its learned action directly, 
 
 ## Acknowledgements
 
-The TD3 implementation in `agents/td3.py`, its training loop, and the `ReplayBuffer` in `utils.py` are adapted from Scott Fujimoto's TD3 reference implementation (https://github.com/sfujim/TD3), which is distributed under the MIT License. `agents/rcrl_td3.py` builds on that implementation; the RCRL objective and statewise multiplier follow the paper cited below.
+The TD3 implementation in `agents/td3.py`, its training loop, and the `ReplayBuffer` in `utils/replay_buffer.py` are adapted from Scott Fujimoto's TD3 reference implementation (https://github.com/sfujim/TD3), which is distributed under the MIT License. `agents/rcrl_td3.py` builds on that implementation; the RCRL objective and statewise multiplier follow the paper cited below.
 
 ## Reference
 

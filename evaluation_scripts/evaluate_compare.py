@@ -1,7 +1,7 @@
 """Side-by-side evaluation of several trained runs.
 
 Evaluates each given ``models/<name>`` checkpoint on the test layouts with
-the same seeded start/goal pairs (``evaluation.evaluate_policy`` seeds every
+the same seeded start/goal pairs (``evaluation_scripts.evaluation.evaluate_policy`` seeds every
 episode by index, so runs are comparable and pairable) and prints one
 comparison table with the performance, margin and multiplier metrics.
 
@@ -10,14 +10,19 @@ value ``lambda * reward_scale``, so a lambda of 0.1 trained with
 ``reward_scale=50`` reads as 5.0 in the scaled column.
 
 Usage:
-    python evaluate_compare.py run_a run_b run_c
-    python evaluate_compare.py run_a run_b --episodes-per-layout 50 --save-json compare.json
-    python evaluate_compare.py run_a run_b run_c --save-png compare.png
+    python evaluation_scripts/evaluate_compare.py run_a run_b run_c
+    python evaluation_scripts/evaluate_compare.py run_a run_b --episodes-per-layout 50 --save-json compare.json
+    python evaluation_scripts/evaluate_compare.py run_a run_b run_c --save-png compare.png
 """
 
 import argparse
 import json
 import os
+import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import matplotlib
 matplotlib.use("Agg")  # must be set before environment imports pyplot
@@ -25,9 +30,9 @@ import matplotlib.pyplot as plt
 
 import numpy as np
 
-from evaluate import _json_safe, build_policy, load_config
+from evaluation_scripts.evaluate import _json_safe, build_policy, load_config
 from environment import create_env
-from evaluation import evaluate_policy
+from evaluation_scripts.evaluation import evaluate_policy
 
 
 def evaluate_run(run_dir, episodes_per_layout, safety_margin=None):

@@ -14,8 +14,8 @@ import torch
 
 from agents.td3 import TD3
 from environment import create_env
-from evaluation import evaluate_policy
-from training_log import TrainingLogger, evaluation_metrics
+from evaluation_scripts.evaluation import evaluate_policy
+from utils.training_log import TrainingLogger, evaluation_metrics
 from utils import ReplayBuffer
 
 

@@ -11,8 +11,8 @@ import torch
 
 from agents.rcrl_td3 import RCRLTD3
 from environment import create_env
-from evaluation import evaluate_policy
-from training_log import TrainingLogger, evaluation_metrics, lambda_metrics
+from evaluation_scripts.evaluation import evaluate_policy
+from utils.training_log import TrainingLogger, evaluation_metrics, lambda_metrics
 from utils import ReplayBufferRCRLTD3
 
 

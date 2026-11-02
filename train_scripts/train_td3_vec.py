@@ -37,7 +37,7 @@ from train_scripts.train_td3 import (
     evaluate_policy,
     set_seed,
 )
-from training_log import TrainingLogger, evaluation_metrics
+from utils.training_log import TrainingLogger, evaluation_metrics
 from utils import ReplayBufferTD3Torch
 
 

@@ -1,3 +1,13 @@
+import os
+import sys
+
+# Allow ``python utils/test.py`` from the repository root: the script
+# directory is on sys.path, not the repository root, so add the root explicitly
+# before importing the project's packages.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import numpy as np
 from environment import create_env, step_batch
 from environment.dynamics import DoubleIntegratorExactDiscretization

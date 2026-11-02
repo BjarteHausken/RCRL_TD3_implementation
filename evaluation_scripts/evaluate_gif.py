@@ -1,6 +1,6 @@
 """Render one evaluation episode to a gif.
 
-Same episode as ``evaluate_visual.py --save-gif``: one sampled start and goal
+Same episode as ``evaluation_scripts/evaluate_visual.py --save-gif``: one sampled start and goal
 on the selected test layout, driven by the deterministic policy. This script
 is headless-only and writes the gif to ``gifs/`` by default, with no window
 and no evaluation report.
@@ -8,6 +8,11 @@ and no evaluation report.
 
 import argparse
 import os
+import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import matplotlib
 
@@ -20,8 +25,8 @@ from PIL import Image
 from agents.td3 import TD3
 from agents.rcrl_td3 import RCRLTD3
 from environment import create_env
-from evaluate import agent_type_from_config, load_config
-from evaluation import _inflate_lidar
+from evaluation_scripts.evaluate import agent_type_from_config, load_config
+from evaluation_scripts.evaluation import _inflate_lidar
 
 
 def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
