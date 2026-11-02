@@ -30,6 +30,31 @@ def agent_type_from_config(config, run_dir):
     return agent_type
 
 
+def build_policy(run_dir, config, state_dim, action_dim, max_action):
+    """Reconstruct the agent a run was trained with and load its checkpoint.
+
+    The checkpoint file names are prefixed with the agent type, so the
+    ``agent`` field of ``config.json`` also locates the weights.
+    """
+    agent_type = agent_type_from_config(config, run_dir)
+    if agent_type == "td3":
+        policy = TD3(state_dim, action_dim, max_action)
+    else:
+        # Agent hyperparameters are a property of the checkpoint, not of the
+        # evaluation: reconstruct the agent the run was trained with.
+        policy = RCRLTD3(
+            state_dim,
+            action_dim,
+            max_action,
+            multiplier_type=config.get("multiplier", "scalar"),
+            max_lambda=config.get("max_lambda", 100.0),
+            initial_lambda=config.get("initial_lambda", 10.0),
+            min_lambda=config.get("min_lambda", 0.0),
+        )
+    policy.load(os.path.join(run_dir, agent_type))
+    return policy
+
+
 def _json_safe(value):
     """Convert NumPy arrays/scalars in an evaluation result to JSON types."""
     if isinstance(value, np.ndarray):
@@ -82,6 +107,8 @@ def save_evaluation_json(path, results, config, run_dir, layout_set,
                 "mean_min_clearance",
             )
         }),
+        # RCRL only; plain TD3 runs record no multiplier.
+        "lambda": _json_safe(results.get("lambda_stats") or {}),
         "per_layout": _json_safe({
             "success_rate": results["per_layout_success_rate"],
             "collision_rate": results["per_layout_collision_rate"],
@@ -117,8 +144,6 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
          safety_margin=None, reward_scale=None, min_start_goal_distance=None,
          save_json=None):
     config = load_config(run_dir)
-    agent_type = agent_type_from_config(config, run_dir)
-    model_path = os.path.join(run_dir, agent_type)
 
     # The constraint margin and reward divisor are properties of the run.
     # Checkpoints trained before these were recorded fall back to the
@@ -147,22 +172,7 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
 
-    if agent_type == "td3":
-        policy = TD3(state_dim, action_dim, max_action)
-    else:
-        # Agent hyperparameters are a property of the checkpoint, not of the
-        # evaluation: reconstruct the agent the run was trained with.
-        policy = RCRLTD3(
-            state_dim,
-            action_dim,
-            max_action,
-            multiplier_type=config.get("multiplier", "scalar"),
-            max_lambda=config.get("max_lambda", 100.0),
-            initial_lambda=config.get("initial_lambda", 10.0),
-            min_lambda=config.get("min_lambda", 0.0),
-        )
-    policy.load(model_path)
-    print("Loaded model:", model_path)
+    policy = build_policy(run_dir, config, state_dim, action_dim, max_action)
 
     # Same randomized regime and metrics as the in-training evaluation; all
     # test layouts are stepped in parallel, with several sampled start/goal

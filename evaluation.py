@@ -33,6 +33,30 @@ def _wilson_interval(count, total, z=1.96):
     return max(0.0, centre - half_width), min(1.0, centre + half_width)
 
 
+def _multiplier_stats(policy, states):
+    """Statistics of the RCRL multiplier lambda(s) over visited states."""
+    device = next(policy.actor.parameters()).device
+    with torch.inference_mode():
+        values = policy.multiplier_for(
+            torch.as_tensor(states, dtype=torch.float32, device=device)
+        ).squeeze(-1)
+        stats = {
+            "mean": float(values.mean()),
+            "std": float(values.std()) if values.numel() > 1 else 0.0,
+            "min": float(values.min()),
+            "max": float(values.max()),
+        }
+        if policy.multiplier_type == "network":
+            stats["cap_fraction"] = float(
+                (values >= 0.99 * policy.max_lambda).float().mean()
+            )
+            floor_tolerance = 0.01 * (policy.max_lambda - policy.min_lambda)
+            stats["floor_fraction"] = float(
+                (values <= policy.min_lambda + floor_tolerance).float().mean()
+            )
+        return stats
+
+
 def evaluate_policy(
     policy,
     layout_set,
@@ -78,6 +102,12 @@ def evaluate_policy(
     over all visited states. All clearance values are distances from the
     vehicle centre to the nearest obstacle surface; the collision boundary is
     ``vehicle_radius``.
+
+    For RCRL policies the result also includes ``lambda_stats``: the mean,
+    standard deviation, min and max of the multiplier lambda(s) over a
+    subsample of visited states (plus ``cap_fraction`` and ``floor_fraction``
+    for network multipliers), measured on the same visited distribution the
+    margin metrics use. Plain TD3 policies return ``lambda_stats=None``.
     """
     if episodes_per_layout < 1:
         raise ValueError("episodes_per_layout must be positive")
@@ -136,7 +166,18 @@ def evaluate_policy(
     clearance_sum = np.zeros(num_episodes)
     constraint_margin = reference.safety_margin
 
+    # RCRL policies: sample visited states (every fifth batch step, up to a
+    # cap) so the multiplier lambda(s) can be measured on the same visited
+    # distribution the margin metrics use.
+    collect_lambda = hasattr(policy, "multiplier_for")
+    lambda_sample_interval = 5
+    lambda_pool_cap = 50000
+    lambda_states = []
+    lambda_state_count = 0
+    step_count = 0
+
     while active.any():
+        step_count += 1
         active_indices = np.flatnonzero(active)
         with torch.inference_mode():
             observations = torch.as_tensor(
@@ -151,6 +192,14 @@ def evaluate_policy(
         states[active_indices] = next_states
         episode_reward[active_indices] += rewards
         episode_steps[active_indices] += 1
+        if (
+            collect_lambda
+            and step_count % lambda_sample_interval == 0
+            and lambda_state_count < lambda_pool_cap
+        ):
+            chunk = states[active_indices].copy()
+            lambda_states.append(chunk)
+            lambda_state_count += chunk.shape[0]
 
         constraint = info["constraint"]
         next_constraint = info["next_constraint"]
@@ -189,7 +238,12 @@ def evaluate_policy(
         where=episode_steps > 0,
     )
 
+    lambda_stats = None
+    if collect_lambda and lambda_states:
+        lambda_stats = _multiplier_stats(policy, np.concatenate(lambda_states))
+
     return {
+        "lambda_stats": lambda_stats,
         "mean_reward": float(episode_reward.mean()),
         "mean_steps": float(episode_steps.mean()),
         "success_rate": float(successes.mean()),

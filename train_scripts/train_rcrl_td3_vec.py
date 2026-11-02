@@ -382,11 +382,11 @@ def parse_args():
              "uses a single fixed Lagrange multiplier for all states, set by "
              "--initial-lambda and not updated during training",
     )
-    parser.add_argument("--max-lambda", type=float, default=2.0,
+    parser.add_argument("--max-lambda", type=float, default=100.0,
                         help="Upper multiplier bound. Scaled with the reward "
                              "divisor: 2.0 at --reward-scale 50 is equivalent "
                              "to 100 with unscaled rewards")
-    parser.add_argument("--initial-lambda", type=float, default=0.1,
+    parser.add_argument("--initial-lambda", type=float, default=10.0,
                         help="Initial lambda; with normalized rewards "
                              "(default --reward-scale 50) 0.1 keeps the "
                              "safety term comparable to the reward term")
@@ -407,12 +407,12 @@ def parse_args():
                              "Distances close to the corridor length may be "
                              "infeasible on some layouts, in which case reset "
                              "raises an error")
-    parser.add_argument("--safety-margin", type=float, default=0.35,
+    parser.add_argument("--safety-margin", type=float, default=0.20,
                         help="Clearance (m from vehicle centre to obstacle "
                              "surface) at which h(s) becomes positive; must "
                              "be at least vehicle_radius (0.2) and is "
                              "independent of collision termination")
-    parser.add_argument("--reward-scale", type=float, default=50.0,
+    parser.add_argument("--reward-scale", type=float, default=1.0,
                         help="Fixed reward divisor used by the environment; "
                              "50 puts the goal bonus at 1.0 so reward and "
                              "safety terms have comparable scale")

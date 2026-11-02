@@ -128,9 +128,10 @@ class RCRLTD3:
     targets evaluate the unperturbed target policy as required by its Bellman
     equation.
 
-    The actor's safety term hinges on positive safety values, so safe states
-    receive no clearance bonus. The multiplier keeps the unhinged dual
-    objective, so lambda can fall again once predicted violations disappear.
+    The actor's safety term is unhinged, so safe states (negative predicted
+    h) receive a clearance bonus that pulls the policy toward them. The
+    multiplier uses the same unhinged dual objective, so lambda can fall
+    again once predicted violations disappear.
     """
 
     def __init__(
@@ -333,9 +334,9 @@ class RCRLTD3:
             q_pi = self.critic.q1(state, policy_action)
             qh_pi = self.safety_critic(state, policy_action)
             lambda_s = self.multiplier_for(state).detach()
-            # Hinge on predicted violations only: safe states must not earn a
-            # clearance bonus that pushes the policy away from usable gaps.
-            actor_loss = (-q_pi + lambda_s * torch.relu(qh_pi)).mean()
+            # Unhinged term: safe states (negative predicted h) earn a
+            # clearance bonus that pulls the policy toward them.
+            actor_loss = (-q_pi + lambda_s * qh_pi).mean()
 
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
