@@ -154,6 +154,18 @@ python -m train_scripts.train_rcrl_td3 --name rcrl_smoke --max-timesteps 8 \
 
 Checkpoints are written under `models/<name>/`. The run's `config.json` records the agent type in its `agent` field (`rcrl_td3` or `td3`) alongside the checkpoint prefix.
 
+### Safety-critic diagnostic
+
+`evaluation_scripts/diagnose_safety_critic.py` tests whether a saved safety critic is undertrained. It rolls out the frozen actor with the run's training reset distribution, freezes one Bellman target per transition, splits by episode, and continues training only the safety critic on those fixed targets. It reports held-out error overall, per constraint bin, for collision/goal/truncation subgroups, and against a Monte-Carlo return, optionally comparing a freshly initialized critic:
+
+```bash
+python evaluation_scripts/diagnose_safety_critic.py --name my_rcrl_run \
+  --num-transitions 500000 --steps 100000 --from-scratch \
+  --save-json results/diagnostics/safety_my_rcrl_run.json
+```
+
+`--layout-type test` checks generalization to unseen layouts, `--expl-noise 0.1` broadens the collected state distribution, and `--save-png PATH` writes the convergence curves.
+
 ## Training metrics and curves
 
 Every trainer also writes `models/<name>/training_log.jsonl`, one JSON object per line. stdout output is unchanged. Each record has a `kind` and a `step` (environment transitions):
@@ -334,6 +346,8 @@ The reward critic and safety critic update every gradient step. The actor update
 | --- | ---: | --- |
 | `--critic-lr` | `1e-4` | TD3 reward-critic learning rate |
 | `--safety-lr` | `1e-4` | reachability safety-critic learning rate |
+| `--safety-updates` | `1` | safety-critic gradient steps per training update; extra steps draw fresh replay batches |
+| `--safety-batch-size` | `--batch-size` | batch size for safety-critic steps; a different size also draws a separate safety batch |
 | `--actor-lr` | `2e-5` | policy learning rate |
 | `--grad-clip` | `1.0` | max global gradient norm for all networks (`0` disables) |
 | `--multiplier-lr` | `1e-5` | statewise dual-ascent learning rate |
@@ -343,6 +357,8 @@ The reward critic and safety critic update every gradient step. The actor update
 | `--min-lambda` | `0.0` | lower multiplier bound; positive values keep the constraint from switching off (`0.0` reproduces the pure dual) |
 | `--initial-lambda` | `10.0` | initial multiplier output (network mode); the fixed value in `--multiplier scalar` mode |
 | `--multiplier` | `network` | `network` for the statewise `lambda(s)` network, `scalar` for one fixed multiplier |
+
+The defaults (`--safety-updates 1 --safety-batch-size` unset) reproduce the original behaviour exactly: the safety critic takes one gradient step on the same minibatch as the reward critic. Raising `--safety-updates` takes that many safety steps per training update, each on a freshly sampled batch, which tests whether the single safety critic is simply under-updated. The reward critic and the target soft updates still run once per update, so a larger `--safety-updates` also increases the drift between the online safety critic and its target. Progress records now include the window means of `critic_loss` and `safety_loss`.
 
 ### 5. Preserve stable TD3 reward learning
 

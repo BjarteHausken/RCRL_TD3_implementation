@@ -154,9 +154,15 @@ class RCRLTD3:
         min_lambda=0.0,
         multiplier_type="network",
         grad_clip=1.0,
+        safety_updates=1,
+        safety_batch_size=None,
     ):
         if policy_freq < 1:
             raise ValueError("policy_freq must be positive")
+        if safety_updates < 1:
+            raise ValueError("safety_updates must be at least 1")
+        if safety_batch_size is not None and safety_batch_size < 1:
+            raise ValueError("safety_batch_size must be positive")
         if multiplier_freq < policy_freq:
             raise ValueError("multiplier_freq must be at least policy_freq")
         if max_lambda <= 0:
@@ -211,6 +217,13 @@ class RCRLTD3:
         self.policy_freq = policy_freq
         self.multiplier_freq = multiplier_freq
         self.grad_clip = grad_clip
+        # Extra safety-critic steps per training update test whether the
+        # single safety critic is undertrained. Defaults reproduce the
+        # original one-step-on-the-shared-batch behaviour exactly.
+        self.safety_updates = int(safety_updates)
+        self.safety_batch_size = (
+            None if safety_batch_size is None else int(safety_batch_size)
+        )
         self.total_it = 0
 
     def multiplier_for(self, state):
@@ -275,18 +288,33 @@ class RCRLTD3:
         if self.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(module.parameters(), self.grad_clip)
 
-    def _update_safety_critic(
-        self, state, action, next_state, h, next_h, not_done
-    ):
-        """One safety-critic gradient step; returns (current_h, safety_loss)."""
+    def safety_target(self, next_state, h, next_h, not_done):
+        """One-step reachability target for the safety critic.
+
+        ``h`` is the constraint of the current state, ``next_h`` the
+        constraint of the state reached by the action, and ``not_done`` is
+        zero on terminal transitions. RCRL evaluates the unperturbed target
+        policy and bootstraps from the current ``h``, which gives
+
+            (1 - discount) * h + discount * max(h, continuation_h).
+
+        Kept as one method so the online update and the offline diagnostic
+        cannot use different formulas.
+        """
         with torch.no_grad():
             # RCRL evaluates the unperturbed target policy and the current h(s).
             safety_next_action = self.actor_target(next_state)
             future_h = self.safety_critic_target(next_state, safety_next_action)
             continuation_h = torch.where(not_done.bool(), future_h, next_h)
-            target_h = (1.0 - self.discount) * h + self.discount * torch.maximum(
+            return (1.0 - self.discount) * h + self.discount * torch.maximum(
                 h, continuation_h
             )
+
+    def _update_safety_critic(
+        self, state, action, next_state, h, next_h, not_done
+    ):
+        """One safety-critic gradient step; returns (current_h, safety_loss)."""
+        target_h = self.safety_target(next_state, h, next_h, not_done)
 
         current_h = self.safety_critic(state, action)
         safety_loss = F.mse_loss(current_h, target_h)
@@ -316,13 +344,42 @@ class RCRLTD3:
         self._clip_grads(self.critic)
         self.critic_optimizer.step()
 
-        current_h, safety_loss = self._update_safety_critic(
-            state, action, next_state, h, next_h, not_done
-        )
+        # The defaults (one update, shared batch) reproduce the original
+        # single step. Extra updates, or a separate safety batch size, draw a
+        # fresh batch for every safety step: repeated passes over the same
+        # samples would overfit and understate the loss.
+        if self.safety_updates == 1 and self.safety_batch_size is None:
+            current_h, safety_loss = self._update_safety_critic(
+                state, action, next_state, h, next_h, not_done
+            )
+            safety_loss_values = [safety_loss.item()]
+        else:
+            safety_batch_size = self.safety_batch_size or batch_size
+            safety_loss_values = []
+            for _ in range(self.safety_updates):
+                (
+                    safety_state,
+                    safety_action,
+                    safety_next_state,
+                    _,
+                    safety_h,
+                    safety_next_h,
+                    safety_not_done,
+                ) = replay_buffer.sample(safety_batch_size)
+                current_h, safety_loss = self._update_safety_critic(
+                    safety_state,
+                    safety_action,
+                    safety_next_state,
+                    safety_h,
+                    safety_next_h,
+                    safety_not_done,
+                )
+                safety_loss_values.append(safety_loss.item())
+        mean_safety_loss = sum(safety_loss_values) / len(safety_loss_values)
 
         metrics = {
             "critic_loss": critic_loss.item(),
-            "safety_loss": safety_loss.item(),
+            "safety_loss": mean_safety_loss,
             "mean_constraint": h.mean().item(),
             "mean_safety_value": current_h.detach().mean().item(),
             "mean_multiplier": self.multiplier_for(state).detach().mean().item(),

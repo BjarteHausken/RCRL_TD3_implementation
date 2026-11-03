@@ -83,6 +83,8 @@ def main(args):
         initial_lambda=args.initial_lambda,
         min_lambda=args.min_lambda,
         multiplier_type=args.multiplier,
+        safety_updates=args.safety_updates,
+        safety_batch_size=args.safety_batch_size,
     )
     if args.random_reset_max_speed > env.dynamics.max_velocity:
         raise ValueError(
@@ -137,6 +139,9 @@ def main(args):
     episode_margin_steps = 0
     episode_max_h = -np.inf
     episode_num = 0
+    # Mean training losses since the last progress record.
+    window_critic_losses = []
+    window_safety_losses = []
 
     try:
         for timestep in range(args.max_timesteps):
@@ -170,7 +175,10 @@ def main(args):
             state = next_state
 
             if replay_buffer.size >= args.batch_size:
-                policy.train(replay_buffer, batch_size=args.batch_size)
+                metrics = policy.train(replay_buffer, batch_size=args.batch_size)
+                if args.log_freq > 0:
+                    window_critic_losses.append(metrics["critic_loss"])
+                    window_safety_losses.append(metrics["safety_loss"])
 
             if terminated or truncated:
                 if episode_num % 20 == 0:
@@ -218,6 +226,18 @@ def main(args):
                         f", lambda_at_cap={lambda_stats['cap_fraction']:.1%}, "
                         f"lambda_at_floor={lambda_stats['floor_fraction']:.1%}"
                     )
+                progress_metrics = {}
+                if window_critic_losses:
+                    progress_metrics["critic_loss"] = float(
+                        np.mean(window_critic_losses)
+                    )
+                    progress_metrics["safety_loss"] = float(
+                        np.mean(window_safety_losses)
+                    )
+                    message += (
+                        f", critic_loss={progress_metrics['critic_loss']:.4f}"
+                        f", safety_loss={progress_metrics['safety_loss']:.4f}"
+                    )
                 print(message)
                 training_log.log(
                     "progress",
@@ -225,7 +245,10 @@ def main(args):
                     replay_size=replay_buffer.size,
                     mean_h_pred=mean_h_pred,
                     **lambda_metrics(lambda_stats),
+                    **progress_metrics,
                 )
+                window_critic_losses.clear()
+                window_safety_losses.clear()
 
             if args.save_freq > 0 and (timestep + 1) % args.save_freq == 0:
                 policy.save(model_path)
@@ -306,6 +329,20 @@ def parse_args():
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--actor-lr", type=float, default=2e-5)
     parser.add_argument("--safety-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--safety-updates",
+        type=int,
+        default=1,
+        help="Safety-critic gradient steps per training update; any extra "
+             "steps draw fresh replay batches (default: 1)",
+    )
+    parser.add_argument(
+        "--safety-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for safety-critic steps (default: --batch-size); a "
+             "different size also draws a separate safety batch",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Max global gradient norm for all networks; 0 disables clipping")
     parser.add_argument("--multiplier-lr", type=float, default=1e-5,
@@ -370,6 +407,10 @@ def parse_args():
         parser.error("--max-timesteps must be positive")
     if args.batch_size < 1 or args.replay_size < args.batch_size:
         parser.error("--replay-size must be at least --batch-size, both positive")
+    if args.safety_updates < 1:
+        parser.error("--safety-updates must be at least 1")
+    if args.safety_batch_size is not None and args.safety_batch_size < 1:
+        parser.error("--safety-batch-size must be positive")
     if args.policy_freq < 1:
         parser.error("--policy-freq must be positive")
     if args.multiplier_freq < args.policy_freq:

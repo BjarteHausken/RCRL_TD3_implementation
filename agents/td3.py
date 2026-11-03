@@ -182,11 +182,19 @@ class TD3(object):
 
 
 	def load(self, filename):
-		self.critic.load_state_dict(torch.load(filename + "_critic.pth"))
-		self.critic_optimizer.load_state_dict(torch.load(filename + "_critic_optimizer.pth"))
+		self.critic.load_state_dict(
+			torch.load(filename + "_critic.pth", map_location=device)
+		)
+		self.critic_optimizer.load_state_dict(
+			torch.load(filename + "_critic_optimizer.pth", map_location=device)
+		)
 		self.critic_target = copy.deepcopy(self.critic)
 
-		self.actor.load_state_dict(torch.load(filename + "_actor.pth"))
-		self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer.pth"))
+		self.actor.load_state_dict(
+			torch.load(filename + "_actor.pth", map_location=device)
+		)
+		self.actor_optimizer.load_state_dict(
+			torch.load(filename + "_actor_optimizer.pth", map_location=device)
+		)
 		self.actor_target = copy.deepcopy(self.actor)
 		

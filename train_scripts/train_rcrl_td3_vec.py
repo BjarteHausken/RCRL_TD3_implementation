@@ -80,6 +80,8 @@ def main(args):
         initial_lambda=args.initial_lambda,
         min_lambda=args.min_lambda,
         multiplier_type=args.multiplier,
+        safety_updates=args.safety_updates,
+        safety_batch_size=args.safety_batch_size,
     )
     if args.random_reset_max_speed > envs[0].dynamics.max_velocity:
         raise ValueError(
@@ -163,6 +165,8 @@ def main(args):
     window_margin_violations = 0
     window_violation_steps = 0
     window_steps = 0
+    window_critic_losses = []
+    window_safety_losses = []
 
     env_steps_done = 0
     next_log = args.log_freq if args.log_freq > 0 else None
@@ -246,7 +250,12 @@ def main(args):
             # overlap kernel execution with launch overhead.
             if replay_buffer.size >= args.batch_size:
                 for _ in range(args.num_envs):
-                    policy.train(replay_buffer, batch_size=args.batch_size)
+                    metrics = policy.train(
+                        replay_buffer, batch_size=args.batch_size
+                    )
+                    if args.log_freq > 0:
+                        window_critic_losses.append(metrics["critic_loss"])
+                        window_safety_losses.append(metrics["safety_loss"])
 
             if next_log is not None and env_steps_done >= next_log:
                 next_log += args.log_freq
@@ -266,6 +275,11 @@ def main(args):
                         f"lambda_at_floor={lambda_stats['floor_fraction']:.1%}"
                     )
                 message += f", {env_steps_done / elapsed:.0f} steps/s"
+                if window_critic_losses:
+                    message += (
+                        f", critic_loss={np.mean(window_critic_losses):.4f}"
+                        f", safety_loss={np.mean(window_safety_losses):.4f}"
+                    )
                 if window_count:
                     message += (
                         f" | episodes={window_count}, "
@@ -285,6 +299,13 @@ def main(args):
                     "steps_per_second": env_steps_done / elapsed,
                 }
                 log_metrics.update(lambda_metrics(lambda_stats))
+                if window_critic_losses:
+                    log_metrics["critic_loss"] = float(
+                        np.mean(window_critic_losses)
+                    )
+                    log_metrics["safety_loss"] = float(
+                        np.mean(window_safety_losses)
+                    )
                 if window_count:
                     log_metrics.update(
                         episodes=window_count,
@@ -307,6 +328,8 @@ def main(args):
                 window_margin_violations = 0
                 window_violation_steps = 0
                 window_steps = 0
+                window_critic_losses.clear()
+                window_safety_losses.clear()
 
             if next_save is not None and env_steps_done >= next_save:
                 next_save += args.save_freq
@@ -396,6 +419,20 @@ def parse_args():
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--actor-lr", type=float, default=2e-5)
     parser.add_argument("--safety-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--safety-updates",
+        type=int,
+        default=1,
+        help="Safety-critic gradient steps per training update; any extra "
+             "steps draw fresh replay batches (default: 1)",
+    )
+    parser.add_argument(
+        "--safety-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for safety-critic steps (default: --batch-size); a "
+             "different size also draws a separate safety batch",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Max global gradient norm for all networks; 0 disables clipping")
     parser.add_argument("--multiplier-lr", type=float, default=1e-5,
@@ -462,6 +499,10 @@ def parse_args():
         parser.error("--num-envs must be positive")
     if args.batch_size < 1 or args.replay_size < args.batch_size:
         parser.error("--replay-size must be at least --batch-size, both positive")
+    if args.safety_updates < 1:
+        parser.error("--safety-updates must be at least 1")
+    if args.safety_batch_size is not None and args.safety_batch_size < 1:
+        parser.error("--safety-batch-size must be positive")
     if args.policy_freq < 1:
         parser.error("--policy-freq must be positive")
     if args.multiplier_freq < args.policy_freq:
