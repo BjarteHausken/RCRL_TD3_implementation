@@ -1,11 +1,19 @@
 # RCRL-TD3
 
-Reinforcement learning for a double-integrator agent that navigates a pillar-filled corridor from a random start to a random goal, reaching the goal as fast as possible while avoiding collisions with walls and pillars. The repository contains:
+Reinforcement learning for a double-integrator agent navigating a pillar-filled corridor: reach a random goal from a random start as fast as possible, without hitting walls or pillars. The repository pairs two agents:
 
 - a **TD3 baseline** that maximizes a progress-based reward, and
-- an **RCRL (Reachability Constrained Reinforcement Learning) agent** that learns the same reward while explicitly learning a reachability safety value, so collision avoidance comes from the learned constraint rather than from reward shaping alone.
+- an **RCRL (Reachability Constrained Reinforcement Learning) agent** — TD3 plus a learned reachability safety value and a Lagrange multiplier, so collision avoidance comes from an explicit learned constraint rather than reward shaping alone.
 
 The RCRL implementation is an adaptation, not a reproduction, of the paper's experiments: the paper's Algorithm 1 is a deterministic actor-critic template, which the paper evaluates in both on-policy and off-policy variants. This repository uses TD3 as its off-policy base. The RCRL safety objective, statewise Lagrangian, and dual update are preserved.
+
+## What is here
+
+- **Two agents, one environment** — plain TD3 and RCRL-TD3 with hyperparameters matched, so comparisons isolate the learned safety constraint.
+- **Ground-truth safety evaluation** — the learned feasible set `{V_h <= 0}` is compared against the actual largest feasible set (the viability kernel of the exact double-integrator dynamics, computed with a fixed-point solver that needs no policy), with IoU and false-safe/false-unsafe metrics.
+- **Interactive diagnostics** — a reachability-value explorer to inspect what the safety critic learned, and an offline diagnostic that tests whether a saved safety critic is undertrained.
+- **Vectorized trainers** — the same algorithms with `--num-envs` parallel environments, device-resident replay buffers, and the same update-to-data ratio as the sequential trainers.
+- **Reproducibility throughout** — randomized start+goal episodes, per-run `config.json` provenance, structured JSONL training logs, and seeded batched evaluation with 95% confidence intervals.
 
 ## Demo
 
@@ -54,22 +62,21 @@ evaluation_scripts/
   evaluation.py              Batched evaluator used by the trainers and scripts
 ```
 
-## Requirements
+## Quick start
 
-Python with NumPy, PyTorch, Gymnasium, Matplotlib, and Pillow. There is no checked-in lockfile, but `requirements.txt` lists the dependencies with minimum versions; it was developed and tested with Python 3.14, NumPy 2.5, PyTorch 2.14, Gymnasium 1.4, Matplotlib 3.11, and Pillow 12. Matplotlib is imported by `environment.py` even for headless runs. From the repository root:
+Python with NumPy, PyTorch, Gymnasium, Matplotlib, and Pillow. There is no checked-in lockfile, but `requirements.txt` lists the dependencies with minimum versions; it was developed and tested with Python 3.14, NumPy 2.5, PyTorch 2.14, Gymnasium 1.4, Matplotlib 3.11, and Pillow 12. Matplotlib is imported by `environment.py` even for headless runs. All commands run from the repository root:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+python -m environment.layouts.generate_layouts --name one   # layout data is generated, not tracked
+python utils/test.py                                        # environment checks (check_env, margins, goal termination)
+python -m train_scripts.train_rcrl_td3 --name rcrl_smoke --max-timesteps 8 \
+  --batch-size 2 --replay-size 32 --eval-freq 0 --log-freq 1 \
+  --output-dir /tmp/rcrl_runs                               # end-to-end training smoke test
 ```
 
-Layout data is not tracked. Before training, evaluating, or running `utils/test.py`, generate the default layout set:
-
-```bash
-python -m environment.layouts.generate_layouts --name one
-```
-
-All commands below run from the repository root.
+Real training runs are described in [Run training](#run-training).
 
 ## Environment
 
@@ -153,14 +160,6 @@ selects the module by agent name and passes the flags through unchanged:
 ./train.sh rcrl-vec --name my_rcrl_vec --num-envs 32
 ./train.sh td3 --name my_td3_run
 ./train.sh td3-vec --name my_td3_vec --num-envs 32
-```
-
-For a small end-to-end check:
-
-```bash
-python -m train_scripts.train_rcrl_td3 --name rcrl_smoke --max-timesteps 8 \
-  --batch-size 2 --replay-size 32 --eval-freq 0 --log-freq 1 \
-  --output-dir /tmp/rcrl_runs
 ```
 
 Checkpoints are written under `models/<name>/`. The run's `config.json` records the agent type in its `agent` field (`rcrl_td3` or `td3`) alongside the checkpoint prefix.
