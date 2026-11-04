@@ -52,14 +52,17 @@ def evaluate_run(run_dir, episodes_per_layout, safety_margin=None):
     config["layout_set"] = config.get("layout_set") or "one"
     config["normalize_obs"] = config.get("normalize_obs", True)
     config["reward_scale"] = config.get("reward_scale", 1.0)
+    config["max_steps"] = config.get("max_steps", 150)
     layout_set = config["layout_set"]
     normalize_obs = config["normalize_obs"]
     reward_scale = config["reward_scale"]
+    max_steps = config["max_steps"]
 
     env = create_env(
         layout_set,
         normalize_obs=normalize_obs,
         reward_scale=reward_scale,
+        max_steps=max_steps,
     )
     if safety_margin is None:
         safety_margin = env.vehicle_radius
@@ -93,6 +96,7 @@ def evaluate_run(run_dir, episodes_per_layout, safety_margin=None):
         min_start_goal_distance=config.get("min_start_goal_distance"),
         safety_margin=safety_margin,
         reward_scale=reward_scale,
+        max_steps=max_steps,
     )
     return config, results
 

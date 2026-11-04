@@ -35,6 +35,7 @@ def main(run_dir, test_layout="random", layout_set="one",
         layout_set,
         normalize_obs=normalize_obs,
         reward_scale=config.get("reward_scale", 1.0),
+        max_steps=config.get("max_steps", 150),
     )
     if safety_margin is None:
         safety_margin = env.vehicle_radius
@@ -68,6 +69,7 @@ def main(run_dir, test_layout="random", layout_set="one",
             max_lambda=config.get("max_lambda", 100.0),
             initial_lambda=config.get("initial_lambda", 10.0),
             min_lambda=config.get("min_lambda", 0.0),
+            safety_twin=config.get("safety_twin", False),
         )
     policy.load(model_path)
     print("Loaded model:", model_path)

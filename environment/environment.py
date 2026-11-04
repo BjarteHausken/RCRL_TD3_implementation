@@ -18,7 +18,7 @@ class CorridorEnvironment(gym.Env):
             pillars_positions=None,
             layout_set="one",
             goal_radius=0.5,
-            max_steps=1000,
+            max_steps=150,
             normalize_obs=True,
             reward_scale=1.0,
     ):

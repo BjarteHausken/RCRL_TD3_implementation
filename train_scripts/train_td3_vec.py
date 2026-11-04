@@ -49,6 +49,7 @@ def main(args):
             args.layout_set,
             normalize_obs=args.normalize_obs,
             reward_scale=args.reward_scale,
+            max_steps=args.max_steps,
         )
         for _ in range(args.num_envs)
     ]
@@ -70,6 +71,13 @@ def main(args):
         critic_lr=args.critic_lr,
         actor_lr=args.actor_lr,
         grad_clip=args.grad_clip,
+        critic_lr_final=args.critic_lr_final,
+        actor_lr_final=args.actor_lr_final,
+        # One update per collected transition, so the anneal spans the
+        # same number of updates as env steps.
+        anneal_steps=(
+            args.max_timesteps if args.lr_decay == "linear" else None
+        ),
     )
     if args.random_reset_max_speed > envs[0].dynamics.max_velocity:
         raise ValueError(
@@ -328,16 +336,36 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-timesteps", type=int, default=30_000)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--replay-size", type=int, default=1_000_000)
     parser.add_argument("--expl-noise", type=float, default=0.1)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--policy-noise", type=float, default=0.1)
     parser.add_argument("--noise-clip", type=float, default=0.5)
-    parser.add_argument("--policy-freq", type=int, default=2)
+    parser.add_argument("--policy-freq", type=int, default=4)
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--actor-lr", type=float, default=2e-5)
+    parser.add_argument(
+        "--critic-lr-final",
+        type=float,
+        default=1e-6,
+        help="Final critic learning rate of the linear anneal (paper: 1e-6)",
+    )
+    parser.add_argument(
+        "--actor-lr-final",
+        type=float,
+        default=1e-6,
+        help="Final actor learning rate of the linear anneal (paper: 1e-6)",
+    )
+    parser.add_argument(
+        "--lr-decay",
+        choices=["linear", "none"],
+        default="linear",
+        help="'linear' anneals every learning rate from its initial to its "
+             "final value over --max-timesteps, as in the paper (Table 1); "
+             "'none' keeps the initial rates constant",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Max global gradient norm for all networks; 0 disables clipping")
     parser.add_argument("--random-reset-margin", type=float, default=0.3,
@@ -355,6 +383,10 @@ def parse_args():
                         help="Fixed reward divisor used by the environment; "
                              "1.0 uses the unscaled reward. Match it across "
                              "agents so rewards are comparable")
+    parser.add_argument("--max-steps", type=int, default=150,
+                        help="Maximum episode length N in environment steps "
+                             "(paper: 360); episodes are truncated at this "
+                             "length")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
     parser.add_argument("--save-freq", type=int, default=5_000,
@@ -376,6 +408,10 @@ def parse_args():
         parser.error("--replay-size must be at least --batch-size, both positive")
     if args.policy_freq < 1:
         parser.error("--policy-freq must be positive")
+    for name in ("critic_lr", "actor_lr", "critic_lr_final",
+                 "actor_lr_final"):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be nonnegative")
     if args.random_reset_margin < 0:
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:

@@ -56,6 +56,7 @@ def main(args):
         args.layout_set,
         normalize_obs=args.normalize_obs,
         reward_scale=args.reward_scale,
+        max_steps=args.max_steps,
     )
     env.action_space.seed(args.seed)
     if args.min_start_goal_distance is None:
@@ -78,13 +79,23 @@ def main(args):
         safety_lr=args.safety_lr,
         grad_clip=args.grad_clip,
         multiplier_lr=args.multiplier_lr,
+        critic_lr_final=args.critic_lr_final,
+        actor_lr_final=args.actor_lr_final,
+        safety_lr_final=args.safety_lr_final,
+        multiplier_lr_final=args.multiplier_lr_final,
+        anneal_steps=(
+            args.max_timesteps if args.lr_decay == "linear" else None
+        ),
         multiplier_freq=args.multiplier_freq,
-        max_lambda=args.max_lambda,
+        max_lambda=None if args.max_lambda <= 0 else args.max_lambda,
         initial_lambda=args.initial_lambda,
         min_lambda=args.min_lambda,
         multiplier_type=args.multiplier,
         safety_updates=args.safety_updates,
         safety_batch_size=args.safety_batch_size,
+        safety_mix=args.safety_mix,
+        safety_mix_warmup=args.safety_mix_warmup,
+        safety_twin=args.safety_twin,
     )
     if args.random_reset_max_speed > env.dynamics.max_velocity:
         raise ValueError(
@@ -94,6 +105,11 @@ def main(args):
         state_dim=state_dim,
         action_dim=action_dim,
         max_size=args.replay_size,
+        # The sub-buffer only exists when the mix is enabled, so the
+        # default runs keep the original behaviour.
+        boundary_threshold=(
+            args.safety_mix_threshold if args.safety_mix > 0 else None
+        ),
     )
 
     run_dir = os.path.join(args.output_dir, args.name)
@@ -116,6 +132,10 @@ def main(args):
         "goal_radius": env.goal_radius,
         "max_steps": env.max_steps,
         "reward_scale": env.reward_scale,
+        "multiplier_parameterization": "softplus",
+        # None records an uncapped multiplier, which is what evaluation and
+        # the agent receive; the CLI's 0 is only a sentinel for "no cap".
+        "max_lambda": None if args.max_lambda <= 0 else args.max_lambda,
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as file:
         json.dump(config, file, indent=2)
@@ -318,17 +338,44 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-timesteps", type=int, default=30_000)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--replay-size", type=int, default=1_000_000)
     parser.add_argument("--expl-noise", type=float, default=0.1)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--policy-noise", type=float, default=0.1)
     parser.add_argument("--noise-clip", type=float, default=0.5)
-    parser.add_argument("--policy-freq", type=int, default=2)
+    parser.add_argument("--policy-freq", type=int, default=4)
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--actor-lr", type=float, default=2e-5)
     parser.add_argument("--safety-lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--critic-lr-final",
+        type=float,
+        default=1e-6,
+        help="Final critic learning rate of the linear anneal (paper: 1e-6)",
+    )
+    parser.add_argument(
+        "--actor-lr-final",
+        type=float,
+        default=1e-6,
+        help="Final actor learning rate of the linear anneal (paper: 1e-6)",
+    )
+    parser.add_argument(
+        "--safety-lr-final",
+        type=float,
+        default=1e-6,
+        help="Final safety-critic learning rate of the linear anneal "
+             "(paper: 1e-6)",
+    )
+    parser.add_argument(
+        "--lr-decay",
+        choices=["linear", "none"],
+        default="linear",
+        help="'linear' anneals every learning rate from its initial to its "
+             "final value over --max-timesteps, as in the paper (Table 1); "
+             "'none' keeps the initial rates constant",
+    )
     parser.add_argument(
         "--safety-updates",
         type=int,
@@ -343,18 +390,70 @@ def parse_args():
         help="Batch size for safety-critic steps (default: --batch-size); a "
              "different size also draws a separate safety batch",
     )
+    parser.add_argument(
+        "--safety-mix",
+        type=float,
+        default=0.0,
+        help="Fraction of each safety-critic batch drawn from a sub-buffer "
+             "of near-boundary transitions (h or next_h within "
+             "--safety-mix-threshold of the constraint, violations "
+             "included). The fraction ramps up as that sub-buffer fills "
+             "past --safety-mix-warmup transitions. 0 (default) keeps "
+             "plain uniform sampling",
+    )
+    parser.add_argument(
+        "--safety-mix-threshold",
+        type=float,
+        default=0.3,
+        help="Constraint value below which a transition counts as "
+             "near-boundary for --safety-mix (h = vehicle_radius - "
+             "min_lidar, so 0.3 keeps clearances within 0.3 m of the "
+             "collision boundary plus every violation)",
+    )
+    parser.add_argument(
+        "--safety-mix-warmup",
+        type=int,
+        default=10_000,
+        help="Boundary-sub-buffer fill level at which --safety-mix reaches "
+             "its full value; below it the mix ramps up linearly from zero",
+    )
+    parser.add_argument(
+        "--safety-twin",
+        dest="safety_twin",
+        action="store_true",
+        default=True,
+        help="Train two safety critics and bootstrap the reachability "
+             "target from the min of the two target heads, mirroring "
+             "TD3's twin reward critics to damp overestimation; the "
+             "actor, multiplier, and logging use head 1 (default). The "
+             "setting is recorded in config.json and the checkpoint "
+             "format changes",
+    )
+    parser.add_argument(
+        "--no-safety-twin",
+        dest="safety_twin",
+        action="store_false",
+        help="Train a single safety critic (the pre-twin behaviour)",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Max global gradient norm for all networks; 0 disables clipping")
-    parser.add_argument("--multiplier-lr", type=float, default=1e-5,
+    parser.add_argument("--multiplier-lr", type=float, default=6e-7,
                         help="Statewise dual-ascent learning rate (network "
-                             "mode); 1e-5 moves lambda(s) on the safety-"
-                             "critic timescale without racing to the cap "
-                             "during the early collision-heavy phase")
-    parser.add_argument("--multiplier-freq", type=int, default=6)
-    parser.add_argument("--max-lambda", type=float, default=100.0,
-                        help="Upper multiplier bound. With the default "
-                             "--reward-scale 1.0 this is the paper's unscaled "
-                             "bound; at --reward-scale 50 use 2.0 instead")
+                             "mode). The paper's value is 6e-7 annealed to "
+                             "1e-7; with the softplus multiplier a step moves "
+                             "lambda by roughly that amount, so short runs "
+                             "need a proportionally larger value")
+    parser.add_argument("--multiplier-lr-final", type=float, default=1e-7,
+                        help="Final multiplier learning rate of the linear "
+                             "anneal (paper: 1e-7)")
+    parser.add_argument("--multiplier-freq", type=int, default=12)
+    parser.add_argument("--max-lambda", type=float, default=0.0,
+                        help="Optional hard cap on lambda(s). The paper's "
+                             "reference implementation leaves the softplus "
+                             "multiplier unbounded and 0 (the default) "
+                             "disables the cap. To cap it, scale the bound "
+                             "with the reward divisor: 100 at "
+                             "--reward-scale 1.0, 2.0 at --reward-scale 50")
     parser.add_argument("--initial-lambda", type=float, default=10.0,
                         help="Initial lambda. With the default "
                              "--reward-scale 1.0 this keeps the safety term "
@@ -390,6 +489,10 @@ def parse_args():
                              "1.0 uses the unscaled reward, while larger "
                              "values shrink returns to keep reward and safety "
                              "terms comparable in the actor loss")
+    parser.add_argument("--max-steps", type=int, default=150,
+                        help="Maximum episode length N in environment steps "
+                             "(paper: 360); episodes are truncated at this "
+                             "length")
     parser.add_argument("--eval-freq", type=int, default=5_000,
                         help="Set to 0 to disable evaluation")
     parser.add_argument("--save-freq", type=int, default=5_000,
@@ -411,21 +514,38 @@ def parse_args():
         parser.error("--safety-updates must be at least 1")
     if args.safety_batch_size is not None and args.safety_batch_size < 1:
         parser.error("--safety-batch-size must be positive")
+    if not 0.0 <= args.safety_mix <= 1.0:
+        parser.error("--safety-mix must be between 0 and 1")
+    if args.safety_mix_threshold < 0:
+        parser.error("--safety-mix-threshold must be nonnegative")
+    if args.safety_mix_warmup < 1:
+        parser.error("--safety-mix-warmup must be positive")
     if args.policy_freq < 1:
         parser.error("--policy-freq must be positive")
     if args.multiplier_freq < args.policy_freq:
         parser.error("--multiplier-freq must be at least --policy-freq")
-    if args.max_lambda <= 0 or not 0 < args.initial_lambda:
-        parser.error("--max-lambda and --initial-lambda must be positive")
+    if args.max_lambda < 0 or not 0 < args.initial_lambda:
+        parser.error(
+            "--max-lambda must be nonnegative (0 disables the cap) and "
+            "--initial-lambda must be positive"
+        )
     if args.min_lambda < 0:
         parser.error("--min-lambda must be nonnegative")
     if args.multiplier == "network" and not (
-        args.min_lambda < args.initial_lambda < args.max_lambda
+        args.min_lambda < args.initial_lambda
     ):
-        parser.error(
-            "network mode requires --min-lambda < --initial-lambda "
-            "< --max-lambda"
-        )
+        parser.error("network mode requires --min-lambda < --initial-lambda")
+    if (
+        args.multiplier == "network"
+        and args.max_lambda > 0
+        and not args.initial_lambda < args.max_lambda
+    ):
+        parser.error("network mode requires --initial-lambda < --max-lambda")
+    for name in ("critic_lr", "actor_lr", "safety_lr", "multiplier_lr",
+                 "critic_lr_final", "actor_lr_final", "safety_lr_final",
+                 "multiplier_lr_final"):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} must be nonnegative")
     if args.random_reset_margin < 0:
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:

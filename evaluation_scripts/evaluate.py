@@ -58,6 +58,7 @@ def build_policy(run_dir, config, state_dim, action_dim, max_action):
             max_lambda=config.get("max_lambda", 100.0),
             initial_lambda=config.get("initial_lambda", 10.0),
             min_lambda=config.get("min_lambda", 0.0),
+            safety_twin=config.get("safety_twin", False),
         )
     policy.load(os.path.join(run_dir, agent_type))
     return policy
@@ -215,6 +216,7 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
         min_start_goal_distance=min_start_goal_distance,
         safety_margin=safety_margin,
         reward_scale=reward_scale,
+        max_steps=config.get("max_steps", 150),
     )
 
     layout_indices = results["layout_indices"]

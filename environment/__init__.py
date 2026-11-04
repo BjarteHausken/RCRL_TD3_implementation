@@ -14,7 +14,7 @@ def create_env(
     max_acceleration=2.0,
     pillars_positions=None,
     goal_radius=0.5,
-    max_steps=1000,
+    max_steps=150,
     normalize_obs=True,
     reward_scale=1.0,
 ):

@@ -39,6 +39,7 @@ def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
         layout_set,
         normalize_obs=normalize_obs,
         reward_scale=config.get("reward_scale", 1.0),
+        max_steps=config.get("max_steps", 150),
     )
     if safety_margin is None:
         safety_margin = env.vehicle_radius
@@ -67,6 +68,7 @@ def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
             max_lambda=config.get("max_lambda", 100.0),
             initial_lambda=config.get("initial_lambda", 10.0),
             min_lambda=config.get("min_lambda", 0.0),
+            safety_twin=config.get("safety_twin", False),
         )
     policy.load(model_path)
 

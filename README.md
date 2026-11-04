@@ -7,6 +7,14 @@ Reinforcement learning for a double-integrator agent that navigates a pillar-fil
 
 The RCRL implementation is an adaptation, not a reproduction, of the paper's experiments: the paper's Algorithm 1 is a deterministic actor-critic template, which the paper evaluates in both on-policy and off-policy variants. This repository uses TD3 as its off-policy base. The RCRL safety objective, statewise Lagrangian, and dual update are preserved.
 
+## Demo
+
+| TD3 | RCRL-TD3 |
+| --- | --- |
+| ![TD3 navigating the corridor](docs/demo_td3.gif) | ![RCRL-TD3 navigating the corridor](docs/demo_rcrl.gif) |
+
+Both gifs show the same sampled episode on layout 22 of the `screen_layouts` test set. The RCRL-TD3 run uses a fixed scalar multiplier (`--multiplier scalar --initial-lambda 10`) and takes a wider path around the pillars, reaching the goal in 59 steps against TD3's 53. Regenerate a gif for any checkpoint with `python evaluation_scripts/evaluate_gif.py --name <run> --layout-set <set> --test-layout <index>`.
+
 ## Repository structure
 
 ```text
@@ -21,11 +29,14 @@ environment/
   manual_control.py          Manual keyboard driving for environment sanity checks
 layouts/                     Layout sets: <set>_{train,test,validation}.npy
 models/                      Training runs as <name>/ (checkpoints + config.json + training_log.jsonl)
+docs/                        Demo gifs shown in this README
 utils/                       Shared support modules
   replay_buffer.py           Replay buffers (plain, and RCRL with h/h')
   training_log.py            Structured JSONL training metrics written by every trainer
   plot_training.py           Training-curve plots from the JSONL logs
   test.py                    Environment checks (gymnasium check_env, margins)
+requirements.txt             Dependency list with minimum versions
+THIRD_PARTY_NOTICES.md       MIT notice for the adapted TD3 code
 train.sh                     Wrapper: ./train.sh <rcrl|rcrl-vec|td3|td3-vec> [trainer flags]
 train_scripts/
   train_rcrl_td3.py          Trainer for the RCRL agent
@@ -45,7 +56,7 @@ evaluation_scripts/
 
 ## Requirements
 
-Python with NumPy, PyTorch, Gymnasium, Matplotlib, and Pillow. There is no checked-in lockfile, but `requirements.txt` lists the dependencies; Matplotlib is imported by `environment.py` even for headless runs. From the repository root:
+Python with NumPy, PyTorch, Gymnasium, Matplotlib, and Pillow. There is no checked-in lockfile, but `requirements.txt` lists the dependencies with minimum versions; it was developed and tested with Python 3.14, NumPy 2.5, PyTorch 2.14, Gymnasium 1.4, Matplotlib 3.11, and Pillow 12. Matplotlib is imported by `environment.py` even for headless runs. From the repository root:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -70,7 +81,7 @@ A fully enclosed corridor of length 30 m with cylindrical pillars (radius 0.3–
 | Action | 2D normalized acceleration command in `[-1, 1]`, scaled by `max_acceleration = 2.0` m/s² in the environment |
 | Observation | velocity (2) + 64 lidar rays of 5.0 m range + goal-relative coordinates (2) → 68-dim |
 | Termination | wall/pillar collision, or goal reached (distance to goal `<= goal_radius = 0.5 m`) |
-| Truncation | 1000-step time limit (bootstrapped; configurable via `max_steps`) |
+| Truncation | 150-step time limit (bootstrapped; configurable via `max_steps`) |
 | Reward | `(2.5 * (d_old - d_new) - 0.1) / reward_scale` per step (`d` = distance to the goal), `+50 / reward_scale` on reaching the goal; `reward_scale` is `1.0` by default |
 
 Actions are emitted normalized to `[-1, 1]` (the actor's `tanh` output scaled by `max_action = 1.0`) and multiplied by `max_acceleration` inside `step`/`step_batch`, so the true acceleration limit is exactly `±2.0 m/s²`. The corridor is closed at both ends; driving into either end wall terminates the episode like any other collision. Checkpoints trained before these environment changes (open goal end, double-scaled actions) are not compatible and must be retrained.
@@ -330,9 +341,11 @@ A predicted unsafe value is positive, so it increases the actor loss. A ReLU or 
 
 ### 3. Learn a state-dependent multiplier
 
-`MultiplierNetwork` produces `lambda(s)`, rather than one global penalty. It outputs `min_lambda + (max_lambda - min_lambda) * sigmoid(...)`, so the bounds are built into the parameterisation instead of being applied afterwards. A plain clamp freezes the dual at the cap because it zeroes the gradient of every saturated state; a straight-through clamp keeps the gradient but lets the pre-clamp value drift arbitrarily far above the cap, which the dual cannot undo within a run. Sigmoid keeps the value inside `[min_lambda, max_lambda]` and keeps a usable gradient at both ends. The multiplier is updated by gradient ascent on `lambda(s) Q_h(s, pi(s))`, implemented as minimization of its negative with the actor and safety critic detached. Thus it grows at states predicted to be unsafe and the training log reports `mean_lambda`, `max_lambda`, `lambda_at_cap`, `lambda_at_floor`, and `mean_h_pred` so saturation is visible immediately.
+`MultiplierNetwork` produces `lambda(s)`, rather than one global penalty. It outputs `min_lambda + softplus(...)`, matching the softplus output layer of the paper's multiplier network (Appendix C, Table 1) and of the reference implementation. Softplus has unit slope, so an Adam step with learning rate `--multiplier-lr` moves `lambda` by roughly that amount. The previous bounded-sigmoid output `min_lambda + (max_lambda - min_lambda) * sigmoid(...)` instead scaled every step by the width of the range and by `sigmoid'(logit)`, so the effective multiplier rate was much smaller than the nominal one and vanished at both bounds; on the paper's `6e-7`-to-`1e-7` schedule the dual would barely move. The multiplier is updated by gradient ascent on `lambda(s) Q_h(s, pi(s))`, implemented as minimization of its negative with the actor and safety critic detached. Thus it grows at states predicted to be unsafe and the training log reports `mean_lambda`, `max_lambda`, `lambda_at_cap`, `lambda_at_floor`, and `mean_h_pred` so saturation is visible immediately.
 
-`--max-lambda` must be scaled with the reward divisor. With the default `--reward-scale 1.0`, the paper's unscaled bound of 100 is the default. At `--reward-scale 50`, use `2.0` instead: keeping 100 there would let the dual apply a penalty 5000× the reward scale, and the actor would avoid the goal to maximize clearance.
+`--max-lambda` is an optional hard ceiling on `lambda(s)`, applied after the softplus. As in the reference implementation it is a clip, not part of the parameterisation, so it zeroes the gradient of saturated states; the default `0` disables it, matching the reference implementation, and the paper's Table 1 sets no upper bound. When a cap is wanted it must be scaled with the reward divisor: `100` at `--reward-scale 1.0` and `2.0` at `--reward-scale 50`. Keeping 100 at scale 50 would let the dual apply a penalty 5000× the reward scale, and the actor would avoid the goal to maximize clearance.
+
+Checkpoints from before the softplus change store multiplier weights that were trained under the sigmoid parameterisation; they still load, but the same weights now denote different `lambda` values, so those runs should be retrained rather than compared against softplus runs.
 
 `--min-lambda` (default `0.0`) is the floor of that range. The pure dual (`0.0`) can drive `lambda(s)` to zero: the dual only sees states that reach the replay buffer, those are overwhelmingly safe once the actor starts avoiding obstacles (a few percent of steps have `h(s) > 0`), and one shared network cannot preserve `lambda` on the rare risky states while it is pushed down by the rest. The actor then lowers its predicted `h` and the constraint switches off — evaluated policies showed `lambda` below `1e-3` and collision rates above 60%. A floor such as `0.5` keeps a minimum safety pressure everywhere while the network still adapts upward on risky states. The floor does not prevent `lambda` from being pinned at `--max-lambda` on the early collision-heavy phase, so the two bounds should be chosen with the reward scale in mind; a run whose log shows `lambda_at_floor` near 100% has no statewise adaptation left and is behaving like `--multiplier scalar`.
 
@@ -340,25 +353,38 @@ A predicted unsafe value is positive, so it increases the actor loss. A ReLU or 
 
 ### 4. Separate update time scales
 
-The reward critic and safety critic update every gradient step. The actor updates every `--policy-freq` steps (default 2), and the statewise multiplier every `--multiplier-freq` steps (default 6, network mode only). Every gradient step clips the global gradient norm of its network to `--grad-clip` (default `1.0`; `0` disables clipping). The default learning rates also make critic/safety updates faster than actor updates, and multiplier updates slowest:
+The reward critic and safety critic update every gradient step. The actor updates every `--policy-freq` steps (default 4), and the statewise multiplier every `--multiplier-freq` steps (default 12, network mode only), so critic/safety updates are fastest, actor updates slower, and multiplier updates slowest, as required by the paper's multi-time-scale assumption. Every gradient step clips the global gradient norm of its network to `--grad-clip` (default `1.0`; `0` disables clipping). Network activations are ELU and Adam uses betas `(0.99, 0.999)`, both from the paper's Table 1. With `--lr-decay linear` (the default) every learning rate anneals linearly from its initial to its final value over `--max-timesteps` updates, which is the paper's schedule; `--lr-decay none` holds the initial rates constant:
 
 | Option | Default | Purpose |
 | --- | ---: | --- |
-| `--critic-lr` | `1e-4` | TD3 reward-critic learning rate |
-| `--safety-lr` | `1e-4` | reachability safety-critic learning rate |
+| `--critic-lr` → `--critic-lr-final` | `1e-4` → `1e-6` | TD3 reward-critic learning rate and its annealed endpoint |
+| `--safety-lr` → `--safety-lr-final` | `1e-4` → `1e-6` | reachability safety-critic learning rate and its annealed endpoint |
+| `--actor-lr` → `--actor-lr-final` | `2e-5` → `1e-6` | policy learning rate and its annealed endpoint |
+| `--multiplier-lr` → `--multiplier-lr-final` | `6e-7` → `1e-7` | statewise dual-ascent learning rate and its annealed endpoint |
+| `--lr-decay` | `linear` | anneal all rates over `--max-timesteps` (`none` holds them constant) |
 | `--safety-updates` | `1` | safety-critic gradient steps per training update; extra steps draw fresh replay batches |
 | `--safety-batch-size` | `--batch-size` | batch size for safety-critic steps; a different size also draws a separate safety batch |
-| `--actor-lr` | `2e-5` | policy learning rate |
+| `--safety-mix` | `0.0` | fraction of each safety batch drawn from a near-boundary sub-buffer; `0` (default) keeps uniform sampling |
+| `--safety-mix-threshold` | `0.3` | constraint value below which a transition is near-boundary (clearance within this of the collision boundary, plus every violation) |
+| `--safety-mix-warmup` | `10_000` | sub-buffer fill level at which `--safety-mix` reaches its full value; below it the mix ramps up from zero |
+| `--safety-twin` / `--no-safety-twin` | on | train two safety critics and bootstrap from the min of the two target heads, as TD3 does for reward (default); `--no-safety-twin` restores the single critic and the old checkpoint format |
+| `--batch-size` | `512` | minibatch size for every update (paper: 512) |
+| `--replay-size` | `1_000_000` | replay capacity |
 | `--grad-clip` | `1.0` | max global gradient norm for all networks (`0` disables) |
-| `--multiplier-lr` | `1e-5` | statewise dual-ascent learning rate |
-| `--policy-freq` | `2` | actor/target update interval |
-| `--multiplier-freq` | `6` | multiplier update interval |
-| `--max-lambda` | `100.0` | upper multiplier bound (paper's unscaled bound at `--reward-scale 1.0`; use `2.0` at scale 50) |
+| `--policy-freq` | `4` | actor/target update interval |
+| `--multiplier-freq` | `12` | multiplier update interval |
+| `--max-lambda` | `0.0` | optional hard cap on `lambda(s)`; `0` (the default) disables it, as in the reference implementation |
 | `--min-lambda` | `0.0` | lower multiplier bound; positive values keep the constraint from switching off (`0.0` reproduces the pure dual) |
 | `--initial-lambda` | `10.0` | initial multiplier output (network mode); the fixed value in `--multiplier scalar` mode |
 | `--multiplier` | `network` | `network` for the statewise `lambda(s)` network, `scalar` for one fixed multiplier |
 
+The anneal spans `--max-timesteps` updates because both trainers perform one update per collected transition. The paper's multiplier rate of `6e-7` is calibrated for its two-million-step runs: over a 250k-step run it lets `lambda(s)` move by only about `0.15` before the endpoint, so the dual can barely respond. When shortening the horizon, scale `--multiplier-lr` and `--multiplier-lr-final` roughly with `2e6 / max_timesteps` to keep the same total dual movement.
+
 The defaults (`--safety-updates 1 --safety-batch-size` unset) reproduce the original behaviour exactly: the safety critic takes one gradient step on the same minibatch as the reward critic. Raising `--safety-updates` takes that many safety steps per training update, each on a freshly sampled batch, which tests whether the single safety critic is simply under-updated. The reward critic and the target soft updates still run once per update, so a larger `--safety-updates` also increases the drift between the online safety critic and its target. Progress records now include the window means of `critic_loss` and `safety_loss`.
+
+`--safety-mix` addresses a different problem: the replay buffer is dominated by safe transitions, so the safety critic gets little supervision exactly where its Bellman target is weakest — states with small but negative `h` that still lead into violation. When enabled, the buffer mirrors every near-boundary transition (h or next_h above `--safety-mix-threshold`, i.e. within that value of the constraint boundary, violations included) into a secondary ring buffer (capacity `replay-size / 5`), and each safety-critic step draws a `--safety-mix` fraction of its batch from that sub-buffer, ramping up linearly as it fills past `--safety-mix-warmup` transitions. The reward critic, actor, and the shared-batch default are unaffected; `--safety-mix 0` allocates no sub-buffer and reproduces the original sampling.
+
+`--safety-twin` (the default; disable with `--no-safety-twin`) trains a second safety critic alongside the first and takes the min of the two target heads when bootstrapping the reachability target — the same anti-overestimation device as TD3's twin reward critics (min over the targets, max operator otherwise untouched). The observed drift of the single critic is overestimation: the learned feasible set shrinks (higher false-unsafe, lower IoU) as it gets more training, which the min should damp. Both heads are trained on the same target (sum of the two MSE losses) with one shared optimizer; the actor loss, the multiplier, and all logging use head 1, mirroring how the reward side uses `q1`. The flag is recorded in `config.json`, which is how the evaluation scripts reconstruct the right architecture — checkpoints with and without the flag have different safety-critic shapes and only load in the matching mode. It composes with `--safety-mix` and `--safety-updates`.
 
 ### 5. Preserve stable TD3 reward learning
 
@@ -389,7 +415,7 @@ The environment therefore divides every reward by a fixed `reward_scale`, record
 
 This is deliberately not a running mean/std normalization. A fixed divisor keeps the MDP stationary — the same state-action pair always yields the same reward — which TD3's targets and the safety critic's fixed point assume. Running statistics would make the reward non-stationary and leak evaluation-time information into the scale.
 
-Reward scale and multiplier must be tuned together. Dividing rewards by 50 divides `Q` by 50, so a multiplier of `lambda = 0.1` produces the same safety pressure as `lambda = 5` did at unscaled rewards (multiplying the whole actor loss by 50 gives `-Q + 50 * lambda * Q_h`). The defaults (`--reward-scale 1.0`, `--initial-lambda 10`, `--max-lambda 100`) start the dual at the paper's unscaled pressure and cap it at the paper's unscaled bound of 100; at `--reward-scale 50`, the equivalent settings are `0.1` and `2.0`. The dual learning rate is `1e-5`. The multiplier network's hidden activations amplify these logit steps, so `lambda(s)` can still reach the cap during the early collision-heavy phase and then fall back once the safety critic stops flagging the visited states. Watch `mean_lambda`, `lambda_at_cap`, `lambda_at_floor`, and `mean_h_pred` in the training log: a sustained cap fraction means the bound is acting as a fixed penalty, while `lambda` close to the floor means the constraint has effectively switched off (unless the floor is set high on purpose). Evaluation falls back to `reward_scale = 1.0` for checkpoints trained before the field existed, so old models still evaluate with their original reward, and `--reward-scale` overrides the recorded value when needed.
+Reward scale and multiplier must be tuned together. Dividing rewards by 50 divides `Q` by 50, so a multiplier of `lambda = 0.1` produces the same safety pressure as `lambda = 5` did at unscaled rewards (multiplying the whole actor loss by 50 gives `-Q + 50 * lambda * Q_h`). The defaults (`--reward-scale 1.0`, `--initial-lambda 10`, `--max-lambda 0` for no cap) start the dual at the paper's unscaled pressure and leave it unbounded, as the reference implementation does; if a cap is wanted at `--reward-scale 50`, use `--initial-lambda 0.1 --max-lambda 2.0`. The dual learning rate is the paper's `6e-7` annealed to `1e-7`, which is calibrated for long runs; see the time-scale table above for scaling it with `--max-timesteps`. The multiplier network's hidden activations amplify these steps, so `lambda(s)` can still reach the cap during the early collision-heavy phase and then fall back once the safety critic stops flagging the visited states. Watch `mean_lambda`, `lambda_at_cap`, `lambda_at_floor`, and `mean_h_pred` in the training log: a sustained cap fraction means the bound is acting as a fixed penalty, while `lambda` close to the floor means the constraint has effectively switched off (unless the floor is set high on purpose). Evaluation falls back to `reward_scale = 1.0` for checkpoints trained before the field existed, so old models still evaluate with their original reward, and `--reward-scale` overrides the recorded value when needed.
 
 ## Randomized episodes
 
@@ -423,6 +449,20 @@ The actor has no runtime safety filter. It returns its learned action directly, 
 
 The TD3 implementation in `agents/td3.py`, its training loop, and the `ReplayBuffer` in `utils/replay_buffer.py` are adapted from Scott Fujimoto's TD3 reference implementation (https://github.com/sfujim/TD3), which is distributed under the MIT License. `agents/rcrl_td3.py` builds on that implementation; the RCRL objective and statewise multiplier follow the paper cited below.
 
+The required notice is reproduced in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
 ## Reference
 
 Yu, D., Ma, H., Li, S. E., & Chen, J. (2022). *Reachability Constrained Reinforcement Learning*. ICML 2022. https://proceedings.mlr.press/v162/yu22d.html
+
+```bibtex
+@inproceedings{yu2022reachability,
+  title     = {Reachability Constrained Reinforcement Learning},
+  author    = {Yu, Dongjie and Ma, Haitong and Li, Shengbo Eben and Chen, Jianyu},
+  booktitle = {Proceedings of the 39th International Conference on Machine Learning},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {162},
+  year      = {2022}
+}
+```

@@ -69,10 +69,16 @@ def _multiplier_stats(policy, states):
             "max": float(values.max()),
         }
         if policy.multiplier_type == "network":
-            stats["cap_fraction"] = float(
-                (values >= 0.99 * policy.max_lambda).float().mean()
-            )
-            floor_tolerance = 0.01 * (policy.max_lambda - policy.min_lambda)
+            if policy.max_lambda is None:
+                # No ceiling to saturate, so report only the floor rate.
+                floor_tolerance = 0.01 * max(policy.initial_lambda, 1.0)
+            else:
+                stats["cap_fraction"] = float(
+                    (values >= 0.99 * policy.max_lambda).float().mean()
+                )
+                floor_tolerance = 0.01 * (
+                    policy.max_lambda - policy.min_lambda
+                )
             stats["floor_fraction"] = float(
                 (values <= policy.min_lambda + floor_tolerance).float().mean()
             )
@@ -90,6 +96,7 @@ def evaluate_policy(
     min_start_goal_distance=None,
     safety_margin=None,
     reward_scale=1.0,
+    max_steps=150,
 ):
     """Evaluate a deterministic policy on every layout of ``layout_type``.
 
@@ -146,6 +153,7 @@ def evaluate_policy(
         layout_set,
         normalize_obs=normalize_obs,
         reward_scale=reward_scale,
+        max_steps=max_steps,
     )
     # The environment constrains at the vehicle radius. Evaluation may report
     # the margin metrics against a wider clearance threshold; the default is
@@ -180,6 +188,7 @@ def evaluate_policy(
             layout_set,
             normalize_obs=normalize_obs,
             reward_scale=reward_scale,
+            max_steps=max_steps,
         )
         states[episode_index], _ = env.reset(
             layout_type=layout_type,

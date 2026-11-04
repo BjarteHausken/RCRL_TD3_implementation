@@ -115,7 +115,10 @@ def evaluate_states(policy, observations, chunk_size=8192):
         )
         with torch.no_grad():
             action = policy.actor(state)
-            value = policy.safety_critic(state, action)
+            if policy.safety_twin:
+                value = policy.safety_critic.h1(state, action)
+            else:
+                value = policy.safety_critic(state, action)
         values[start:end] = value.cpu().numpy().ravel()
         actions[start:end] = action.cpu().numpy()
     return values, actions
@@ -682,6 +685,7 @@ def main(
         layout_set,
         normalize_obs=normalize_obs,
         reward_scale=config.get("reward_scale", 1.0),
+        max_steps=config.get("max_steps", 150),
     )
 
     layouts = {
@@ -733,6 +737,7 @@ def main(
         max_lambda=config.get("max_lambda", 100.0),
         initial_lambda=config.get("initial_lambda", 10.0),
         min_lambda=config.get("min_lambda", 0.0),
+        safety_twin=config.get("safety_twin", False),
     )
     policy.load(model_path)
     policy.actor.eval()

@@ -59,7 +59,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from agents.rcrl_td3 import SafetyCritic
+from agents.rcrl_td3 import SafetyCritic, SafetyCriticTwin
 from environment import create_env, step_batch
 from evaluation_scripts.evaluate import build_policy, load_config
 
@@ -196,6 +196,7 @@ def resolve_run(run_dir, args):
         layout_set,
         normalize_obs=normalize_obs,
         reward_scale=reward_scale,
+        max_steps=config.get("max_steps", 150),
     )
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -211,6 +212,7 @@ def resolve_run(run_dir, args):
         "layout_set": layout_set,
         "normalize_obs": normalize_obs,
         "reward_scale": reward_scale,
+        "max_steps": config.get("max_steps", 150),
         "random_reset_margin": config.get("random_reset_margin", 0.3),
         "random_reset_max_speed": config.get("random_reset_max_speed", 1.0),
         "min_start_goal_distance": float(min_start_goal_distance),
@@ -256,6 +258,7 @@ def collect_dataset(policy, env, settings, args, device):
             settings["layout_set"],
             normalize_obs=settings["normalize_obs"],
             reward_scale=settings["reward_scale"],
+            max_steps=settings["max_steps"],
         )
         for _ in range(args.num_envs)
     ]
@@ -550,7 +553,12 @@ def predict(critic, states, actions, batch_size, device):
             action = torch.as_tensor(
                 actions[start:end], dtype=torch.float32, device=device
             )
-            predictions[start:end] = critic(state, action).squeeze(-1).cpu()
+            value = critic(state, action)
+            # A twin critic returns (head1, head2); report head 1, matching
+            # the value the agent uses for the actor and logging.
+            if isinstance(value, tuple):
+                value = value[0]
+            predictions[start:end] = value.squeeze(-1).cpu()
     return predictions
 
 
@@ -607,7 +615,13 @@ def train_critic(critic, data, train_mask, val_mask, settings, args, device,
             targets[batch_indices], dtype=torch.float32, device=device
         ).unsqueeze(-1)
         critic.train()
-        loss = F.mse_loss(critic(state, action), target)
+        critic_output = critic(state, action)
+        if isinstance(critic_output, tuple):
+            # A twin critic is trained on both heads, matching the agent.
+            head1, head2 = critic_output
+            loss = F.mse_loss(head1, target) + F.mse_loss(head2, target)
+        else:
+            loss = F.mse_loss(critic_output, target)
         optimizer.zero_grad()
         loss.backward()
         if settings["grad_clip"] > 0:
@@ -878,7 +892,14 @@ def main(args):
     scratch_history = None
     scratch_optimizer = None
     if args.from_scratch:
-        scratch_critic = SafetyCritic(
+        # Match the checkpoint's architecture so the fresh critic is a
+        # like-for-like control.
+        scratch_critic_class = (
+            SafetyCriticTwin
+            if config.get("safety_twin", False)
+            else SafetyCritic
+        )
+        scratch_critic = scratch_critic_class(
             env.observation_space.shape[0], env.action_space.shape[0]
         ).to(device)
         scratch_final, scratch_history, scratch_optimizer = train_critic(

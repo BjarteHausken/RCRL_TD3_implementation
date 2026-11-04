@@ -366,6 +366,7 @@ def main(args):
         layout_set,
         normalize_obs=normalize_obs,
         reward_scale=reward_scale,
+        max_steps=config.get("max_steps", 150),
     )
     # Aligning the velocity grid with one full-braking step keeps the
     # deceleration exactly representable on the grid.

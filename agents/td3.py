@@ -13,188 +13,232 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Paper: https://arxiv.org/abs/1802.09477
 # Adapted from Scott Fujimoto's reference implementation
 # (https://github.com/sfujim/TD3), MIT License.
+# Networks, optimizer and schedule follow the RCRL paper's Table 1 (ELU
+# hidden layers, Adam with betas (0.99, 0.999), linear learning-rate anneal,
+# policy update interval 4) so the plain baseline differs from RCRL only in
+# the safety machinery.
 
 
 class Actor(nn.Module):
-	def __init__(self, state_dim, action_dim, max_action):
-		super(Actor, self).__init__()
+    def __init__(self, state_dim, action_dim, max_action):
+        super(Actor, self).__init__()
 
-		self.l1 = nn.Linear(state_dim, 256)
-		self.l2 = nn.Linear(256, 256)
-		self.l3 = nn.Linear(256, action_dim)
-		
-		self.max_action = max_action
-		
+        self.l1 = nn.Linear(state_dim, 256)
+        self.l2 = nn.Linear(256, 256)
+        self.l3 = nn.Linear(256, action_dim)
 
-	def forward(self, state):
-		a = F.relu(self.l1(state))
-		a = F.relu(self.l2(a))
-		return self.max_action * torch.tanh(self.l3(a))
+        self.max_action = max_action
+
+    def forward(self, state):
+        a = F.elu(self.l1(state))
+        a = F.elu(self.l2(a))
+        return self.max_action * torch.tanh(self.l3(a))
 
 
 class Critic(nn.Module):
-	def __init__(self, state_dim, action_dim):
-		super(Critic, self).__init__()
+    def __init__(self, state_dim, action_dim):
+        super(Critic, self).__init__()
 
-		# Q1 architecture
-		self.l1 = nn.Linear(state_dim + action_dim, 256)
-		self.l2 = nn.Linear(256, 256)
-		self.l3 = nn.Linear(256, 1)
+        # Q1 architecture
+        self.l1 = nn.Linear(state_dim + action_dim, 256)
+        self.l2 = nn.Linear(256, 256)
+        self.l3 = nn.Linear(256, 1)
 
-		# Q2 architecture
-		self.l4 = nn.Linear(state_dim + action_dim, 256)
-		self.l5 = nn.Linear(256, 256)
-		self.l6 = nn.Linear(256, 1)
+        # Q2 architecture
+        self.l4 = nn.Linear(state_dim + action_dim, 256)
+        self.l5 = nn.Linear(256, 256)
+        self.l6 = nn.Linear(256, 1)
 
+    def forward(self, state, action):
+        sa = torch.cat([state, action], 1)
 
-	def forward(self, state, action):
-		sa = torch.cat([state, action], 1)
+        q1 = F.elu(self.l1(sa))
+        q1 = F.elu(self.l2(q1))
+        q1 = self.l3(q1)
 
-		q1 = F.relu(self.l1(sa))
-		q1 = F.relu(self.l2(q1))
-		q1 = self.l3(q1)
+        q2 = F.elu(self.l4(sa))
+        q2 = F.elu(self.l5(q2))
+        q2 = self.l6(q2)
+        return q1, q2
 
-		q2 = F.relu(self.l4(sa))
-		q2 = F.relu(self.l5(q2))
-		q2 = self.l6(q2)
-		return q1, q2
+    def Q1(self, state, action):
+        sa = torch.cat([state, action], 1)
 
-
-	def Q1(self, state, action):
-		sa = torch.cat([state, action], 1)
-
-		q1 = F.relu(self.l1(sa))
-		q1 = F.relu(self.l2(q1))
-		q1 = self.l3(q1)
-		return q1
+        q1 = F.elu(self.l1(sa))
+        q1 = F.elu(self.l2(q1))
+        q1 = self.l3(q1)
+        return q1
 
 
 class TD3(object):
-	def __init__(
-		self,
-		state_dim,
-		action_dim,
-		max_action,
-		discount=0.99,
-		tau=0.005,
-		policy_noise=0.1,
-		noise_clip=0.5,
-		policy_freq=2,
-		critic_lr=1e-4,
-		actor_lr=2e-5,
-		grad_clip=1.0
-	):
-		if grad_clip < 0:
-			raise ValueError("grad_clip must be nonnegative")
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        max_action,
+        discount=0.99,
+        tau=0.005,
+        policy_noise=0.1,
+        noise_clip=0.5,
+        policy_freq=4,
+        critic_lr=1e-4,
+        actor_lr=2e-5,
+        critic_lr_final=1e-6,
+        actor_lr_final=1e-6,
+        anneal_steps=None,
+        grad_clip=1.0,
+    ):
+        if grad_clip < 0:
+            raise ValueError("grad_clip must be nonnegative")
+        for name, lr in (
+            ("critic_lr", critic_lr),
+            ("actor_lr", actor_lr),
+            ("critic_lr_final", critic_lr_final),
+            ("actor_lr_final", actor_lr_final),
+        ):
+            if lr < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        if anneal_steps is not None and anneal_steps < 1:
+            raise ValueError("anneal_steps must be positive or None")
 
-		self.actor = Actor(state_dim, action_dim, max_action).to(device)
-		self.actor_target = copy.deepcopy(self.actor)
-		self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        # Adam betas from the paper's Table 1.
+        self.adam_betas = (0.99, 0.999)
 
-		self.critic = Critic(state_dim, action_dim).to(device)
-		self.critic_target = copy.deepcopy(self.critic)
-		self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.actor = Actor(state_dim, action_dim, max_action).to(device)
+        self.actor_target = copy.deepcopy(self.actor)
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(), lr=actor_lr, betas=self.adam_betas
+        )
 
-		self.max_action = max_action
-		self.discount = discount
-		self.tau = tau
-		self.policy_noise = policy_noise
-		self.noise_clip = noise_clip
-		self.policy_freq = policy_freq
-		self.grad_clip = grad_clip
+        self.critic = Critic(state_dim, action_dim).to(device)
+        self.critic_target = copy.deepcopy(self.critic)
+        self.critic_optimizer = torch.optim.Adam(
+            self.critic.parameters(), lr=critic_lr, betas=self.adam_betas
+        )
 
-		self.total_it = 0
+        self.max_action = max_action
+        self.discount = discount
+        self.tau = tau
+        self.policy_noise = policy_noise
+        self.noise_clip = noise_clip
+        self.policy_freq = policy_freq
+        self.grad_clip = grad_clip
 
+        # Linear learning-rate annealing from the initial to the final value
+        # over ``anneal_steps`` updates, as in the paper. ``None`` keeps the
+        # rates constant, which is what evaluation uses.
+        self.critic_lr = critic_lr
+        self.actor_lr = actor_lr
+        self.critic_lr_final = critic_lr_final
+        self.actor_lr_final = actor_lr_final
+        self.anneal_steps = None if anneal_steps is None else int(anneal_steps)
 
-	def select_action(self, state):
-		state = torch.FloatTensor(state.reshape(1, -1)).to(device)
-		with torch.no_grad():
-			return self.actor(state).cpu().data.numpy().flatten()
+        self.total_it = 0
 
+    def select_action(self, state):
+        state = torch.FloatTensor(state.reshape(1, -1)).to(device)
+        with torch.no_grad():
+            return self.actor(state).cpu().data.numpy().flatten()
 
-	def train(self, replay_buffer, batch_size=256):
-		self.total_it += 1
+    def _learning_rate(self, initial, final):
+        """Linearly decay ``initial`` to ``final`` over ``anneal_steps``."""
+        if self.anneal_steps is None:
+            return initial
+        progress = min(1.0, self.total_it / self.anneal_steps)
+        return initial + (final - initial) * progress
 
-		# Sample replay buffer 
-		state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
+    def _apply_learning_rate(self, optimizer, initial, final):
+        """Set ``optimizer`` to its scheduled rate for the current update."""
+        learning_rate = self._learning_rate(initial, final)
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate
 
-		with torch.no_grad():
-			# Select action according to policy and add clipped noise
-			noise = (
-				torch.randn_like(action) * self.policy_noise
-			).clamp(-self.noise_clip, self.noise_clip)
-			
-			next_action = (
-				self.actor_target(next_state) + noise
-			).clamp(-self.max_action, self.max_action)
+    def train(self, replay_buffer, batch_size=512):
+        self.total_it += 1
 
-			# Compute the target Q value
-			target_Q1, target_Q2 = self.critic_target(next_state, next_action)
-			target_Q = torch.min(target_Q1, target_Q2)
-			target_Q = reward + not_done * self.discount * target_Q
+        # Sample replay buffer
+        state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
 
-		# Get current Q estimates
-		current_Q1, current_Q2 = self.critic(state, action)
+        with torch.no_grad():
+            # Select action according to policy and add clipped noise
+            noise = (
+                torch.randn_like(action) * self.policy_noise
+            ).clamp(-self.noise_clip, self.noise_clip)
 
-		# Compute critic loss
-		critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+            next_action = (
+                self.actor_target(next_state) + noise
+            ).clamp(-self.max_action, self.max_action)
 
-		# Optimize the critic
-		self.critic_optimizer.zero_grad()
-		critic_loss.backward()
-		if self.grad_clip > 0:
-			torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
-		self.critic_optimizer.step()
-		# Delayed policy updates
-		if self.total_it % self.policy_freq == 0:
+            # Compute the target Q value
+            target_Q1, target_Q2 = self.critic_target(next_state, next_action)
+            target_Q = torch.min(target_Q1, target_Q2)
+            target_Q = reward + not_done * self.discount * target_Q
 
-			# Compute actor losse
-			actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
-			
-			# Optimize the actor
-			self.actor_optimizer.zero_grad()
-			actor_loss.backward()
-			if self.grad_clip > 0:
-				torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip)
-			self.actor_optimizer.step()
+        # Get current Q estimates
+        current_Q1, current_Q2 = self.critic(state, action)
 
-			# Update the frozen target models
-			for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-				target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        # Compute critic loss
+        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
 
-			for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-				target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        # Optimize the critic
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        if self.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip)
+        self._apply_learning_rate(
+            self.critic_optimizer, self.critic_lr, self.critic_lr_final
+        )
+        self.critic_optimizer.step()
+        # Delayed policy updates
+        if self.total_it % self.policy_freq == 0:
 
+            # Compute actor loss
+            actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
 
-	def save(self, filename):
-		checkpoints = {
-			"_critic.pth": self.critic.state_dict(),
-			"_critic_optimizer.pth": self.critic_optimizer.state_dict(),
-			"_actor.pth": self.actor.state_dict(),
-			"_actor_optimizer.pth": self.actor_optimizer.state_dict(),
-		}
-		# Write each artifact to a temp file, then move it into place, so a
-		# crash mid-save cannot leave a mixed (partially updated) checkpoint.
-		for suffix, state_dict in checkpoints.items():
-			tmp_path = filename + suffix + ".tmp"
-			torch.save(state_dict, tmp_path)
-			os.replace(tmp_path, filename + suffix)
+            # Optimize the actor
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            if self.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip)
+            self._apply_learning_rate(
+                self.actor_optimizer, self.actor_lr, self.actor_lr_final
+            )
+            self.actor_optimizer.step()
 
+            # Update the frozen target models
+            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-	def load(self, filename):
-		self.critic.load_state_dict(
-			torch.load(filename + "_critic.pth", map_location=device)
-		)
-		self.critic_optimizer.load_state_dict(
-			torch.load(filename + "_critic_optimizer.pth", map_location=device)
-		)
-		self.critic_target = copy.deepcopy(self.critic)
+            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-		self.actor.load_state_dict(
-			torch.load(filename + "_actor.pth", map_location=device)
-		)
-		self.actor_optimizer.load_state_dict(
-			torch.load(filename + "_actor_optimizer.pth", map_location=device)
-		)
-		self.actor_target = copy.deepcopy(self.actor)
-		
+    def save(self, filename):
+        checkpoints = {
+            "_critic.pth": self.critic.state_dict(),
+            "_critic_optimizer.pth": self.critic_optimizer.state_dict(),
+            "_actor.pth": self.actor.state_dict(),
+            "_actor_optimizer.pth": self.actor_optimizer.state_dict(),
+        }
+        # Write each artifact to a temp file, then move it into place, so a
+        # crash mid-save cannot leave a mixed (partially updated) checkpoint.
+        for suffix, state_dict in checkpoints.items():
+            tmp_path = filename + suffix + ".tmp"
+            torch.save(state_dict, tmp_path)
+            os.replace(tmp_path, filename + suffix)
+
+    def load(self, filename):
+        self.critic.load_state_dict(
+            torch.load(filename + "_critic.pth", map_location=device)
+        )
+        self.critic_optimizer.load_state_dict(
+            torch.load(filename + "_critic_optimizer.pth", map_location=device)
+        )
+        self.critic_target = copy.deepcopy(self.critic)
+
+        self.actor.load_state_dict(
+            torch.load(filename + "_actor.pth", map_location=device)
+        )
+        self.actor_optimizer.load_state_dict(
+            torch.load(filename + "_actor_optimizer.pth", map_location=device)
+        )
+        self.actor_target = copy.deepcopy(self.actor)
