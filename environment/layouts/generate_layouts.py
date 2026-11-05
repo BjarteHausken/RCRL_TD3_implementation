@@ -254,6 +254,13 @@ def parse_args():
     )
     parser.add_argument("--min-radius", type=float, default=MIN_RADIUS)
     parser.add_argument("--max-radius", type=float, default=MAX_RADIUS)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=SEED,
+        help="RNG seed; train, test, and validation sets use seed, "
+             f"seed+1, and seed+2 (default: {SEED}).",
+    )
     return parser.parse_args()
 
 
@@ -271,5 +278,6 @@ if __name__ == "__main__":
         max_corridor_width=args.max_width,
         min_radius=args.min_radius,
         max_radius=args.max_radius,
+        seed=args.seed,
     )
 
