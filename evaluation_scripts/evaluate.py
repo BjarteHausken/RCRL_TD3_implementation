@@ -59,6 +59,7 @@ def build_policy(run_dir, config, state_dim, action_dim, max_action):
             initial_lambda=config.get("initial_lambda", 10.0),
             min_lambda=config.get("min_lambda", 0.0),
             safety_twin=config.get("safety_twin", False),
+            safety_aggregation=config.get("safety_aggregation", "min"),
         )
     policy.load(os.path.join(run_dir, agent_type))
     return policy

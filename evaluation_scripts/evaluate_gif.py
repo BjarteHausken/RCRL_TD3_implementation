@@ -69,6 +69,7 @@ def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
             initial_lambda=config.get("initial_lambda", 10.0),
             min_lambda=config.get("min_lambda", 0.0),
             safety_twin=config.get("safety_twin", False),
+            safety_aggregation=config.get("safety_aggregation", "min"),
         )
     policy.load(model_path)
 
