@@ -201,6 +201,7 @@ class RCRLTD3:
         safety_mix=0.0,
         safety_mix_warmup=10_000,
         safety_twin=False,
+        safety_aggregation="min",
     ):
         if policy_freq < 1:
             raise ValueError("policy_freq must be positive")
@@ -224,6 +225,10 @@ class RCRLTD3:
             raise ValueError("grad_clip must be nonnegative")
         if multiplier_type not in ("scalar", "network"):
             raise ValueError("multiplier_type must be 'scalar' or 'network'")
+        if safety_aggregation not in ("min", "mean"):
+            raise ValueError(
+                "safety_aggregation must be 'min' or 'mean'"
+            )
         if anneal_steps is not None and anneal_steps < 1:
             raise ValueError("anneal_steps must be positive or None")
         for name, lr in (
@@ -269,6 +274,7 @@ class RCRLTD3:
         )
 
         self.safety_twin = bool(safety_twin)
+        self.safety_aggregation = safety_aggregation
         if self.safety_twin:
             self.safety_critic = SafetyCriticTwin(state_dim, action_dim).to(device)
         else:
@@ -434,10 +440,13 @@ class RCRLTD3:
 
             (1 - discount) * h + discount * max(h, continuation_h).
 
-        With the twin critic the two target heads are combined by min
-        before the max with h, which equals the min of the two full twin
-        targets (max with the constant h distributes over min) and damps
-        overestimation the way TD3's min over the reward critics does.
+        With the twin critic the two target heads are combined by
+        ``safety_aggregation`` before the max with h. ``"min"`` (the default)
+        equals the min of the two full twin targets (max with the constant h
+        distributes over min) and damps overestimation the way TD3's min over
+        the reward critics does. ``"mean"`` averages the two heads instead;
+        it cannot be moved outside the max, so it is applied to the
+        continuation value directly.
 
         Kept as one method so the online update and the offline diagnostic
         cannot use different formulas.
@@ -449,7 +458,10 @@ class RCRLTD3:
                 future_h1, future_h2 = self.safety_critic_target(
                     next_state, safety_next_action
                 )
-                future_h = torch.minimum(future_h1, future_h2)
+                if self.safety_aggregation == "mean":
+                    future_h = 0.5 * (future_h1 + future_h2)
+                else:
+                    future_h = torch.minimum(future_h1, future_h2)
             else:
                 future_h = self.safety_critic_target(next_state, safety_next_action)
             continuation_h = torch.where(not_done.bool(), future_h, next_h)

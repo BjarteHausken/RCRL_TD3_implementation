@@ -96,6 +96,7 @@ def main(args):
         safety_mix=args.safety_mix,
         safety_mix_warmup=args.safety_mix_warmup,
         safety_twin=args.safety_twin,
+        safety_aggregation=args.safety_aggregation,
     )
     if args.random_reset_max_speed > env.dynamics.max_velocity:
         raise ValueError(
@@ -434,6 +435,15 @@ def parse_args():
         dest="safety_twin",
         action="store_false",
         help="Train a single safety critic (the pre-twin behaviour)",
+    )
+    parser.add_argument(
+        "--safety-aggregation",
+        choices=["min", "mean"],
+        default="min",
+        help="How the twin safety-critic target heads are combined: min "
+             "(TD3-style overestimation damping, default) or mean "
+             "(average the two heads, the variant used by the earlier "
+             "_avg/_v2 runs)",
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Max global gradient norm for all networks; 0 disables clipping")
