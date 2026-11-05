@@ -42,6 +42,46 @@ from utils.training_log import TrainingLogger, evaluation_metrics, lambda_metric
 from utils import ReplayBufferRCRLTD3Torch
 
 
+# Region of the state space the safety critic is evaluated on in the
+# false-safe analysis: clearance within 0.4 m of the collision boundary
+# (h = vehicle_radius - min_lidar, so clearance = -h) at speed above
+# 1 m/s (about one braking distance at max_acceleration 2.0 m/s^2).
+REPLAY_NEAR_CLEARANCE = 0.4
+REPLAY_FAST_SPEED = 1.0
+
+
+def replay_buffer_stats(buffer, sample_size=65_536):
+    """Distribution of the transitions currently in the replay buffer.
+
+    The stored observation starts with the velocity (2 components), so
+    speed is the norm of the first two state components. Reports the
+    share of transitions in the near-boundary, fast, and combined
+    danger region, plus the violation share and means, to diagnose
+    whether the safety critic is data-starved where it is least accurate.
+    Draws a random subsample when the buffer is larger than sample_size.
+    """
+    n = buffer.size
+    if n == 0:
+        return {}
+    if n > sample_size:
+        idx = torch.randint(0, n, (sample_size,), device=buffer.device)
+        state, h = buffer.state[idx], buffer.h[idx]
+    else:
+        state, h = buffer.state[:n], buffer.h[:n]
+    speed = torch.linalg.vector_norm(state[:, :2], dim=1)
+    clearance = -h[:, 0]
+    near = clearance < REPLAY_NEAR_CLEARANCE
+    fast = speed > REPLAY_FAST_SPEED
+    return {
+        "replay_frac_near": near.float().mean().item(),
+        "replay_frac_fast": fast.float().mean().item(),
+        "replay_frac_danger": (near & fast).float().mean().item(),
+        "replay_frac_violation": (clearance < 0).float().mean().item(),
+        "replay_mean_clearance": clearance.mean().item(),
+        "replay_mean_speed": speed.mean().item(),
+    }
+
+
 def main(args):
     # Treat SIGTERM like Ctrl-C so a killed run still writes a checkpoint.
     signal.signal(signal.SIGTERM, signal.default_int_handler)
@@ -321,6 +361,7 @@ def main(args):
                     "mean_h_pred": mean_h_pred,
                     "steps_per_second": env_steps_done / elapsed,
                 }
+                log_metrics.update(replay_buffer_stats(replay_buffer))
                 log_metrics.update(lambda_metrics(lambda_stats))
                 if window_critic_losses:
                     log_metrics["critic_loss"] = float(
