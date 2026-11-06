@@ -115,50 +115,66 @@ def injection_buffer_stats(buffer):
     }
 
 
-def collect_injection_transitions(policy, env, count):
-    """Generate ``count`` danger-shell transitions for the safety critic.
+def collect_injection_transitions(policy, env, count,
+                                  max_speed=INJECT_MAX_SPEED,
+                                  horizon=1):
+    """Generate danger-shell transitions for the safety critic.
 
-    Each transition places the environment in a state sampled close to an
-    obstacle and fast (``env.sample_danger_state``), resets onto it with a
-    fresh layout and goal, takes one step under the current actor, and
-    stores ``(s, a, s', reward, h, next_h, done)``. The stored action is
-    only a critic input feature - RCRL's safety target bootstraps from the
-    target policy, so the action taken does not bias the target. Many
-    transitions end in collision; those violations are exactly the labels
-    the safety critic is under-supervised on during normal training.
+    Each of the ``count`` seeds is a state sampled close to an obstacle
+    and fast (``env.sample_danger_state``); the environment is reset onto
+    it with a fresh layout and goal and rolled out for up to ``horizon``
+    steps under the current actor, storing ``(s, a, s', reward, h,
+    next_h, done)`` for every step. The stored action is only a critic
+    input feature - RCRL's safety target bootstraps from the target
+    policy, so the action taken does not bias the target. A horizon
+    greater than one stores the consecutive transitions along the
+    braking trajectory, so the critic directly observes how clearance
+    evolves over several steps. Many rollouts end in collision; those
+    violations are exactly the labels the safety critic is
+    under-supervised on during normal training.
     """
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    states = np.empty((count, state_dim), dtype=np.float32)
-    actions = np.empty((count, action_dim), dtype=np.float32)
-    next_states = np.empty((count, state_dim), dtype=np.float32)
-    rewards = np.zeros((count, 1), dtype=np.float32)
-    h = np.zeros((count, 1), dtype=np.float32)
-    next_h = np.zeros((count, 1), dtype=np.float32)
-    dones = np.zeros((count, 1), dtype=np.float32)
+    horizon = max(1, int(horizon))
+    capacity = count * horizon
+    states = np.empty((capacity, state_dim), dtype=np.float32)
+    actions = np.empty((capacity, action_dim), dtype=np.float32)
+    next_states = np.empty((capacity, state_dim), dtype=np.float32)
+    rewards = np.zeros((capacity, 1), dtype=np.float32)
+    h = np.zeros((capacity, 1), dtype=np.float32)
+    next_h = np.zeros((capacity, 1), dtype=np.float32)
+    dones = np.zeros((capacity, 1), dtype=np.float32)
 
-    for i in range(count):
+    n = 0
+    for _ in range(count):
         state = env.sample_danger_state(
             min_clearance=INJECT_MIN_CLEARANCE,
             max_clearance=INJECT_MAX_CLEARANCE,
             min_speed=INJECT_MIN_SPEED,
-            max_speed=INJECT_MAX_SPEED,
+            max_speed=max_speed,
         )
         observation, _ = env.reset(state=state, layout_type="train")
-        obs_tensor = torch.as_tensor(
-            observation[None], dtype=torch.float32, device=device
-        )
-        with torch.no_grad():
-            action = policy.actor(obs_tensor).cpu().numpy()[0]
-        next_obs, _, terminated, _, info = env.step(action)
-        states[i] = observation
-        actions[i] = action
-        next_states[i] = next_obs
-        h[i, 0] = info["constraint"]
-        next_h[i, 0] = info["next_constraint"]
-        dones[i, 0] = terminated
+        terminated = False
+        for _ in range(horizon):
+            if terminated:
+                break
+            obs_tensor = torch.as_tensor(
+                observation[None], dtype=torch.float32, device=device
+            )
+            with torch.no_grad():
+                action = policy.actor(obs_tensor).cpu().numpy()[0]
+            next_obs, _, terminated, _, info = env.step(action)
+            states[n] = observation
+            actions[n] = action
+            next_states[n] = next_obs
+            h[n, 0] = info["constraint"]
+            next_h[n, 0] = info["next_constraint"]
+            dones[n, 0] = terminated
+            n += 1
+            observation = next_obs
 
-    return states, actions, next_states, rewards, h, next_h, dones
+    return (states[:n], actions[:n], next_states[:n], rewards[:n],
+            h[:n], next_h[:n], dones[:n])
 
 
 def main(args):
@@ -234,9 +250,10 @@ def main(args):
     )
 
     # Safety data generator: a dedicated environment repeatedly placed in
-    # a state sampled close to an obstacle and fast, stepped once under the
-    # current actor. The generated transitions feed the safety-critic
-    # batches only, never the reward critic or the actor.
+    # a state sampled close to an obstacle and fast, rolled out for
+    # ``--safety-inject-horizon`` steps under the current actor (default
+    # one). The generated transitions feed the safety-critic batches
+    # only, never the reward critic or the actor.
     inject_env = None
     injection_buffer = None
     if args.safety_inject > 0:
@@ -410,7 +427,9 @@ def main(args):
             if injection_buffer is not None:
                 injection_buffer.add_batch(
                     *collect_injection_transitions(
-                        policy, inject_env, args.safety_inject
+                        policy, inject_env, args.safety_inject,
+                        max_speed=args.safety_inject_max_speed,
+                        horizon=args.safety_inject_horizon,
                     )
                 )
             env_steps_done += args.num_envs
@@ -706,6 +725,26 @@ def parse_args():
              "buffer fills past --safety-mix-warmup; defaults to 0.25 "
              "when --safety-inject > 0",
     )
+    parser.add_argument(
+        "--safety-inject-max-speed",
+        type=float,
+        default=INJECT_MAX_SPEED,
+        help="Top speed (m/s) of the danger-shell seeds the generator "
+             "samples, capped by the dynamics' max_velocity anyway; raise "
+             "to 3.0 to supervise the top-speed braking shell (default "
+             "2.5 leaves the 2.5-3.0 m/s range outside the seeds)",
+    )
+    parser.add_argument(
+        "--safety-inject-horizon",
+        type=int,
+        default=1,
+        help="Actor steps rolled out per danger-shell seed; every "
+             "intermediate transition is stored (the rollout stops at "
+             "collision), so --safety-inject N yields up to N*H "
+             "transitions per vectorized step. H > 1 shows the critic "
+             "the full braking trajectory (default 1: one step per "
+             "seed)",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Max global gradient norm for all networks; 0 disables clipping")
     parser.add_argument("--multiplier-lr", type=float, default=6e-7,
@@ -799,6 +838,10 @@ def parse_args():
         args.safety_inject_mix = 0.25 if args.safety_inject > 0 else 0.0
     if not 0.0 <= args.safety_inject_mix <= 1.0:
         parser.error("--safety-inject-mix must be between 0 and 1")
+    if args.safety_inject_max_speed <= 0:
+        parser.error("--safety-inject-max-speed must be positive")
+    if args.safety_inject_horizon < 1:
+        parser.error("--safety-inject-horizon must be at least 1")
     if args.policy_freq < 1:
         parser.error("--policy-freq must be positive")
     if args.multiplier_freq < args.policy_freq:
