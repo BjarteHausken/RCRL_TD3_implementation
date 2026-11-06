@@ -93,6 +93,28 @@ def replay_buffer_stats(buffer, sample_size=65_536):
     }
 
 
+def injection_buffer_stats(buffer):
+    """Fill and label statistics of the safety data generator's ring.
+
+    ``inject_size`` tracks the mix ramp (the blended fraction reaches
+    ``--safety-inject-mix`` once the ring fills past
+    ``--safety-mix-warmup``), and the violation shares show what fraction
+    of generated transitions end in a collision - the labels the safety
+    critic was starved of. Rows with a violation at the next state are
+    the supervision for the infeasible part of the shell.
+    """
+    n = buffer.size
+    if n == 0:
+        return {"inject_size": 0}
+    next_h = buffer.next_h[:n, 0]
+    not_done = buffer.not_done[:n, 0]
+    return {
+        "inject_size": int(n),
+        "inject_frac_violation": (next_h > 0).float().mean().item(),
+        "inject_frac_done": (not_done == 0).float().mean().item(),
+    }
+
+
 def collect_injection_transitions(policy, env, count):
     """Generate ``count`` danger-shell transitions for the safety critic.
 
@@ -448,6 +470,8 @@ def main(args):
                     "steps_per_second": env_steps_done / elapsed,
                 }
                 log_metrics.update(replay_buffer_stats(replay_buffer))
+                if injection_buffer is not None:
+                    log_metrics.update(injection_buffer_stats(injection_buffer))
                 log_metrics.update(lambda_metrics(lambda_stats))
                 if window_critic_losses:
                     log_metrics["critic_loss"] = float(
