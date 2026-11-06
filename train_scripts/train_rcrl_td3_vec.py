@@ -49,6 +49,17 @@ from utils import ReplayBufferRCRLTD3Torch
 REPLAY_NEAR_CLEARANCE = 0.4
 REPLAY_FAST_SPEED = 1.0
 
+# Region the safety data generator samples danger seeds from: clearance
+# 0.05-0.4 m from the collision boundary at speed 1.0-2.5 m/s, i.e. the
+# same danger region replay_buffer_stats measures in the main buffer.
+INJECT_MIN_CLEARANCE = 0.05
+INJECT_MAX_CLEARANCE = REPLAY_NEAR_CLEARANCE
+INJECT_MIN_SPEED = REPLAY_FAST_SPEED
+INJECT_MAX_SPEED = 2.5
+
+# Ring size for generated danger-shell transitions.
+INJECTION_BUFFER_SIZE = 100_000
+
 
 def replay_buffer_stats(buffer, sample_size=65_536):
     """Distribution of the transitions currently in the replay buffer.
@@ -80,6 +91,52 @@ def replay_buffer_stats(buffer, sample_size=65_536):
         "replay_mean_clearance": clearance.mean().item(),
         "replay_mean_speed": speed.mean().item(),
     }
+
+
+def collect_injection_transitions(policy, env, count):
+    """Generate ``count`` danger-shell transitions for the safety critic.
+
+    Each transition places the environment in a state sampled close to an
+    obstacle and fast (``env.sample_danger_state``), resets onto it with a
+    fresh layout and goal, takes one step under the current actor, and
+    stores ``(s, a, s', reward, h, next_h, done)``. The stored action is
+    only a critic input feature - RCRL's safety target bootstraps from the
+    target policy, so the action taken does not bias the target. Many
+    transitions end in collision; those violations are exactly the labels
+    the safety critic is under-supervised on during normal training.
+    """
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    states = np.empty((count, state_dim), dtype=np.float32)
+    actions = np.empty((count, action_dim), dtype=np.float32)
+    next_states = np.empty((count, state_dim), dtype=np.float32)
+    rewards = np.zeros((count, 1), dtype=np.float32)
+    h = np.zeros((count, 1), dtype=np.float32)
+    next_h = np.zeros((count, 1), dtype=np.float32)
+    dones = np.zeros((count, 1), dtype=np.float32)
+
+    for i in range(count):
+        state = env.sample_danger_state(
+            min_clearance=INJECT_MIN_CLEARANCE,
+            max_clearance=INJECT_MAX_CLEARANCE,
+            min_speed=INJECT_MIN_SPEED,
+            max_speed=INJECT_MAX_SPEED,
+        )
+        observation, _ = env.reset(state=state, layout_type="train")
+        obs_tensor = torch.as_tensor(
+            observation[None], dtype=torch.float32, device=device
+        )
+        with torch.no_grad():
+            action = policy.actor(obs_tensor).cpu().numpy()[0]
+        next_obs, _, terminated, _, info = env.step(action)
+        states[i] = observation
+        actions[i] = action
+        next_states[i] = next_obs
+        h[i, 0] = info["constraint"]
+        next_h[i, 0] = info["next_constraint"]
+        dones[i, 0] = terminated
+
+    return states, actions, next_states, rewards, h, next_h, dones
 
 
 def main(args):
@@ -136,6 +193,7 @@ def main(args):
         safety_mix_warmup=args.safety_mix_warmup,
         safety_twin=args.safety_twin,
         safety_aggregation=args.safety_aggregation,
+        safety_inject_mix=args.safety_inject_mix,
     )
     if args.random_reset_max_speed > envs[0].dynamics.max_velocity:
         raise ValueError(
@@ -152,6 +210,26 @@ def main(args):
             args.safety_mix_threshold if args.safety_mix > 0 else None
         ),
     )
+
+    # Safety data generator: a dedicated environment repeatedly placed in
+    # a state sampled close to an obstacle and fast, stepped once under the
+    # current actor. The generated transitions feed the safety-critic
+    # batches only, never the reward critic or the actor.
+    inject_env = None
+    injection_buffer = None
+    if args.safety_inject > 0:
+        inject_env = create_env(
+            args.layout_set,
+            normalize_obs=args.normalize_obs,
+            reward_scale=args.reward_scale,
+            max_steps=args.max_steps,
+        )
+        injection_buffer = ReplayBufferRCRLTD3Torch(
+            state_dim,
+            action_dim,
+            max_size=INJECTION_BUFFER_SIZE,
+            device=device,
+        )
 
     run_dir = os.path.join(args.output_dir, args.name)
     os.makedirs(run_dir, exist_ok=True)
@@ -307,6 +385,12 @@ def main(args):
                 next_constraints,
                 dones,
             )
+            if injection_buffer is not None:
+                injection_buffer.add_batch(
+                    *collect_injection_transitions(
+                        policy, inject_env, args.safety_inject
+                    )
+                )
             env_steps_done += args.num_envs
 
             # One update per collected transition, back-to-back so the GPU can
@@ -314,7 +398,9 @@ def main(args):
             if replay_buffer.size >= args.batch_size:
                 for _ in range(args.num_envs):
                     metrics = policy.train(
-                        replay_buffer, batch_size=args.batch_size
+                        replay_buffer,
+                        batch_size=args.batch_size,
+                        injection_buffer=injection_buffer,
                     )
                     if args.log_freq > 0:
                         window_critic_losses.append(metrics["critic_loss"])
@@ -578,6 +664,24 @@ def parse_args():
              "(average the two heads, the variant used by the earlier "
              "_avg/_v2 runs)",
     )
+    parser.add_argument(
+        "--safety-inject",
+        type=int,
+        default=0,
+        help="Number of danger-shell transitions generated per vectorized "
+             "step by the safety data generator (a state sampled close to "
+             "an obstacle and fast, stepped once under the current actor, "
+             "fed to the safety-critic batches only); 0 disables",
+    )
+    parser.add_argument(
+        "--safety-inject-mix",
+        type=float,
+        default=None,
+        help="Fraction of each safety-critic batch drawn from the "
+             "generated danger-shell transitions, ramping up as that "
+             "buffer fills past --safety-mix-warmup; defaults to 0.25 "
+             "when --safety-inject > 0",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Max global gradient norm for all networks; 0 disables clipping")
     parser.add_argument("--multiplier-lr", type=float, default=6e-7,
@@ -665,6 +769,12 @@ def parse_args():
         parser.error("--safety-mix-threshold must be nonnegative")
     if args.safety_mix_warmup < 1:
         parser.error("--safety-mix-warmup must be positive")
+    if args.safety_inject < 0:
+        parser.error("--safety-inject must be nonnegative")
+    if args.safety_inject_mix is None:
+        args.safety_inject_mix = 0.25 if args.safety_inject > 0 else 0.0
+    if not 0.0 <= args.safety_inject_mix <= 1.0:
+        parser.error("--safety-inject-mix must be between 0 and 1")
     if args.policy_freq < 1:
         parser.error("--policy-freq must be positive")
     if args.multiplier_freq < args.policy_freq:

@@ -297,6 +297,81 @@ class CorridorEnvironment(gym.Env):
             "obstructed for the requested margin"
         )
 
+    def sample_danger_state(
+        self,
+        min_clearance=0.05,
+        max_clearance=0.4,
+        min_speed=1.0,
+        max_speed=2.5,
+        max_attempts=1000,
+    ):
+        """Sample a state in the danger shell: close to an obstacle and fast.
+
+        The position is drawn at clearance in ``[min_clearance,
+        max_clearance]`` from a randomly chosen pillar (75%) or corridor
+        wall (25%), and the velocity is drawn with speed in
+        ``[min_speed, max_speed]`` in the front half-plane relative to that
+        obstacle (toward it, or tangential to it), so the state is close to
+        the collision boundary (clearance = -h) and fast at the same time
+        - the region of the state space that normal training barely visits.
+        Returns ``(x, x_dot, y, y_dot)`` for ``reset(state=...)``.
+        """
+        half_width = self.width / 2
+        position_margin = self.vehicle_radius + min_clearance
+
+        for _ in range(max_attempts):
+            if self.np_random.uniform() < 0.75 and len(self.pillars) > 0:
+                pillar_x, pillar_y, pillar_radius = self.pillars[
+                    self.np_random.integers(len(self.pillars))
+                ]
+                clearance = self.np_random.uniform(min_clearance, max_clearance)
+                angle = 2.0 * np.pi * self.np_random.uniform()
+                x = pillar_x + (
+                    pillar_radius + self.vehicle_radius + clearance
+                ) * np.cos(angle)
+                y = pillar_y + (
+                    pillar_radius + self.vehicle_radius + clearance
+                ) * np.sin(angle)
+                toward = np.arctan2(pillar_y - y, pillar_x - x)
+            else:
+                side = self.np_random.choice((-1.0, 1.0))
+                clearance = self.np_random.uniform(min_clearance, max_clearance)
+                y = side * (half_width - self.vehicle_radius - clearance)
+                x = self.np_random.uniform(
+                    position_margin, self.length - position_margin
+                )
+                toward = np.arctan2(side, 0.0)
+
+            if not (
+                position_margin <= x <= self.length - position_margin
+                and abs(y) <= half_width - position_margin
+            ):
+                continue
+
+            clear_of_pillars = all(
+                np.hypot(x - pillar_x, y - pillar_y)
+                >= pillar_radius + self.vehicle_radius + min_clearance
+                for pillar_x, pillar_y, pillar_radius in self.pillars
+            )
+            if not clear_of_pillars:
+                continue
+
+            speed = self.np_random.uniform(min_speed, max_speed)
+            speed = min(speed, self.dynamics.max_velocity)
+            # Front half-plane relative to the obstacle: toward it or
+            # tangential to it, but never directly away.
+            offset = (2.0 * self.np_random.uniform() - 1.0) * 0.75 * np.pi
+            v_angle = toward + offset
+            return np.array(
+                [x, speed * np.cos(v_angle), y, speed * np.sin(v_angle)],
+                dtype=np.float32,
+            )
+
+        raise RuntimeError(
+            "Could not sample a danger state; the corridor may be too "
+            "obstructed for the requested clearance range"
+        )
+
     def step(self, action):
         old_x, _, old_y, _ = self.dynamics.get_state()
         old_goal_distance = np.hypot(old_x - self.goal[0], old_y - self.goal[1])
