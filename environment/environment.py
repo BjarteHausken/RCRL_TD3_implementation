@@ -252,14 +252,21 @@ class CorridorEnvironment(gym.Env):
 
         return observation, info
 
-    def sample_random_state(self, margin=0.5, max_speed=1.0, max_attempts=1000):
+    def sample_random_state(self, margin=0.5, max_speed=1.0, min_speed=0.0,
+                            max_attempts=1000):
         """Sample a random safe state (x, x_dot, y, y_dot) inside the corridor.
 
         The position is drawn uniformly while keeping at least
         ``vehicle_radius + margin`` clearance from the walls and
         ``pillar_radius + vehicle_radius + margin`` from every pillar center,
-        so the sampled state is feasible with a safety buffer. The velocity is
-        drawn uniformly from a disk of radius ``max_speed``.
+        so the sampled state is feasible with a safety buffer. Sampling with
+        ``margin=0`` therefore covers the whole free corridor, from one
+        collision boundary to the other.
+
+        The velocity direction is drawn uniformly. The speed is drawn
+        uniformly from ``[min_speed, max_speed]`` when ``min_speed > 0``
+        (so a nonzero initial velocity is guaranteed), and from a disk of
+        radius ``max_speed`` otherwise.
 
         Sampling uses the currently loaded layout's width and pillars, so a
         start and goal sampled after ``reset`` selects a layout are both
@@ -267,6 +274,10 @@ class CorridorEnvironment(gym.Env):
         position (e.g. to cover more of the feasible set during training).
         Call ``reset(state=...)`` with the returned state.
         """
+        if min_speed < 0.0 or max_speed < min_speed:
+            raise ValueError(
+                "min_speed must be nonnegative and at most max_speed"
+            )
         if getattr(self, "np_random", None) is None:
             self.np_random = np.random.default_rng()
 
@@ -285,7 +296,10 @@ class CorridorEnvironment(gym.Env):
             if not pillar_clear:
                 continue
 
-            speed = max_speed * np.sqrt(self.np_random.uniform())
+            if min_speed > 0.0:
+                speed = self.np_random.uniform(min_speed, max_speed)
+            else:
+                speed = max_speed * np.sqrt(self.np_random.uniform())
             angle = 2.0 * np.pi * self.np_random.uniform()
             return np.array(
                 [x, speed * np.cos(angle), y, speed * np.sin(angle)],

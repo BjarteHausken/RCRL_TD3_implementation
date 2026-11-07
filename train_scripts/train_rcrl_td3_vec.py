@@ -115,6 +115,27 @@ def injection_buffer_stats(buffer):
     }
 
 
+def random_train_reset(env, min_speed, seed=None):
+    """Reset into a uniformly random free-corridor state with nonzero speed.
+
+    Used during the random phase (``--random-train-fraction``): the state
+    is drawn uniformly over the whole free corridor with a speed in
+    ``[min_speed, dynamics.max_velocity]`` and a random direction, so the
+    replay buffer sees every part of the map, including the fast
+    near-obstacle states normal training rarely visits. The layout is
+    selected before the state is sampled, so the state is valid for the
+    geometry the episode runs on; the goal is sampled by the second reset
+    and is uniformly random, without a minimum start-goal distance.
+    """
+    env.reset(layout_type="train", seed=seed)
+    state = env.sample_random_state(
+        margin=0.0,
+        max_speed=env.dynamics.max_velocity,
+        min_speed=min_speed,
+    )
+    return env.reset(state=state, layout_type="fixed")
+
+
 def collect_injection_transitions(policy, env, count,
                                   max_speed=INJECT_MAX_SPEED,
                                   horizon=1):
@@ -147,13 +168,17 @@ def collect_injection_transitions(policy, env, count,
 
     n = 0
     for _ in range(count):
+        # Select the layout before sampling the seed: the sampler
+        # validates clearance against the loaded geometry, so the state
+        # must be sampled on the layout the rollout actually runs on.
+        env.reset(layout_type="train")
         state = env.sample_danger_state(
             min_clearance=INJECT_MIN_CLEARANCE,
             max_clearance=INJECT_MAX_CLEARANCE,
             min_speed=INJECT_MIN_SPEED,
             max_speed=max_speed,
         )
-        observation, _ = env.reset(state=state, layout_type="train")
+        observation, _ = env.reset(state=state, layout_type="fixed")
         terminated = False
         for _ in range(horizon):
             if terminated:
@@ -237,6 +262,10 @@ def main(args):
         raise ValueError(
             "--random-reset-max-speed must not exceed the dynamics max_velocity"
         )
+    if args.random_train_min_speed > envs[0].dynamics.max_velocity:
+        raise ValueError(
+            "--random-train-min-speed must not exceed the dynamics max_velocity"
+        )
     replay_buffer = ReplayBufferRCRLTD3Torch(
         state_dim,
         action_dim,
@@ -315,14 +344,21 @@ def main(args):
     observations = np.empty((args.num_envs, state_dim), dtype=np.float32)
     for i, env in enumerate(envs):
         env.action_space.seed(args.seed + i)
-        # The first episode reset also seeds the environment RNG.
-        observation, _ = episode_reset(
-            env,
-            args.random_reset_margin,
-            args.random_reset_max_speed,
-            min_start_goal_distance=args.min_start_goal_distance,
-            seed=args.seed + i,
-        )
+        # The first episode reset also seeds the environment RNG. The
+        # random phase starts at step zero, so it owns that first reset
+        # whenever it is enabled.
+        if args.random_train_fraction > 0.0:
+            observation, _ = random_train_reset(
+                env, args.random_train_min_speed, seed=args.seed + i
+            )
+        else:
+            observation, _ = episode_reset(
+                env,
+                args.random_reset_margin,
+                args.random_reset_max_speed,
+                min_start_goal_distance=args.min_start_goal_distance,
+                seed=args.seed + i,
+            )
         observations[i] = observation
 
     # Per-step batched transition storage, filled by the stepping loop.
@@ -357,18 +393,33 @@ def main(args):
     meta_steps = -(-args.max_timesteps // args.num_envs)  # ceil division
     try:
         for _ in range(meta_steps):
-            # One actor forward pass for all environments.
-            obs_tensor = torch.as_tensor(
-                observations, dtype=torch.float32, device=device
+            # The first ``--random-train-fraction`` of the run fills the
+            # replay buffer with fully random transitions; the rest uses
+            # the usual actor plus exploration noise.
+            random_phase = (
+                env_steps_done
+                < args.random_train_fraction * args.max_timesteps
             )
-            with torch.no_grad():
-                policy_actions = policy.actor(obs_tensor).cpu().numpy()
-            noise = np.random.normal(
-                loc=0.0,
-                scale=max_action * args.expl_noise,
-                size=(args.num_envs, action_dim),
-            )
-            actions[:] = np.clip(policy_actions + noise, -max_action, max_action)
+            if random_phase:
+                actions[:] = np.random.uniform(
+                    -max_action, max_action,
+                    size=(args.num_envs, action_dim),
+                )
+            else:
+                # One actor forward pass for all environments.
+                obs_tensor = torch.as_tensor(
+                    observations, dtype=torch.float32, device=device
+                )
+                with torch.no_grad():
+                    policy_actions = policy.actor(obs_tensor).cpu().numpy()
+                noise = np.random.normal(
+                    loc=0.0,
+                    scale=max_action * args.expl_noise,
+                    size=(args.num_envs, action_dim),
+                )
+                actions[:] = np.clip(
+                    policy_actions + noise, -max_action, max_action
+                )
 
             states[:] = observations
             next_states, step_rewards, terminated, truncated, info = step_batch(
@@ -401,12 +452,19 @@ def main(args):
                     window_margin_violations += int(episode_max_h[i] > 0.0)
                     window_violation_steps += int(episode_margin_steps[i])
                     window_steps += int(episode_steps[i])
-                    observation, _ = episode_reset(
-                        env,
-                        args.random_reset_margin,
-                        args.random_reset_max_speed,
-                        min_start_goal_distance=args.min_start_goal_distance,
-                    )
+                    if random_phase:
+                        observation, _ = random_train_reset(
+                            env, args.random_train_min_speed
+                        )
+                    else:
+                        observation, _ = episode_reset(
+                            env,
+                            args.random_reset_margin,
+                            args.random_reset_max_speed,
+                            min_start_goal_distance=(
+                                args.min_start_goal_distance
+                            ),
+                        )
                     observations[i] = observation
                     episode_reward[i] = 0.0
                     episode_steps[i] = 0
@@ -487,6 +545,7 @@ def main(args):
                     "replay_size": replay_buffer.size,
                     "mean_h_pred": mean_h_pred,
                     "steps_per_second": env_steps_done / elapsed,
+                    "random_train_phase": int(random_phase),
                 }
                 log_metrics.update(replay_buffer_stats(replay_buffer))
                 if injection_buffer is not None:
@@ -788,6 +847,20 @@ def parse_args():
                              "boundary for sampled start and goal states")
     parser.add_argument("--random-reset-max-speed", type=float, default=1.0,
                         help="Maximum speed (m/s) of the sampled start velocity")
+    parser.add_argument("--random-train-fraction", type=float, default=0.0,
+                        help="Fraction of --max-timesteps whose training "
+                             "episodes start from a uniformly sampled free-"
+                             "corridor state with a nonzero speed and take "
+                             "uniformly random actions. These transitions "
+                             "go into the normal replay buffer, so the "
+                             "rest of training (current actor plus "
+                             "--expl-noise) sees a mix of random and "
+                             "semi-random trajectories; 0 disables (default)")
+    parser.add_argument("--random-train-min-speed", type=float, default=1.0,
+                        help="Minimum initial speed (m/s) of the states "
+                             "sampled during --random-train-fraction; the "
+                             "maximum is the dynamics' max_velocity "
+                             "(default 1.0, guaranteeing nonzero velocity)")
     parser.add_argument("--min-start-goal-distance", type=float, default=None,
                         help="Minimum start-goal distance (m) for sampled "
                              "episodes; default is 2 * goal_radius (1.0 m). "
@@ -872,6 +945,10 @@ def parse_args():
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:
         parser.error("--random-reset-max-speed must be positive")
+    if not 0.0 <= args.random_train_fraction <= 1.0:
+        parser.error("--random-train-fraction must be between 0 and 1")
+    if args.random_train_min_speed <= 0:
+        parser.error("--random-train-min-speed must be positive")
     if (args.min_start_goal_distance is not None
             and args.min_start_goal_distance < 0):
         parser.error("--min-start-goal-distance must be nonnegative")
