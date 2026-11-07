@@ -28,6 +28,10 @@ Usage:
     python evaluation_scripts/evaluate_feasibility.py --name my_rcrl_run \
         --layout-indices 0 1 --slices 0,0 1,0 0,1 --goals-per-layout 8 \
         --save-json results/feasibility.json --save-png results/feasibility.png
+    # Negative velocities need one quoted argument, since argparse rejects
+    # entries like -1,0:
+    python evaluation_scripts/evaluate_feasibility.py --name my_rcrl_run \
+        --slices "0,0 2,0 -2,0 0,2 0,-2"
 """
 
 import argparse
@@ -67,15 +71,24 @@ FALSE_UNSAFE = "#2a78d6"
 
 
 def parse_slices(values):
-    """Parse ``--slices`` entries of the form ``vx,vy``."""
+    """Parse ``--slices`` entries of the form ``vx,vy``.
+
+    Each argument may hold several entries separated by whitespace or
+    semicolons, so negative velocities can be passed as one quoted argument
+    (``--slices "0,0 2,0 -2,0"``); argparse would otherwise reject entries
+    such as ``-2,0`` as unknown options.
+    """
     if values is None:
         return list(DEFAULT_SLICES)
     slices = []
     for text in values:
-        parts = text.split(",")
-        if len(parts) != 2:
-            raise SystemExit(f"--slices entries must be vx,vy (got {text!r})")
-        slices.append((float(parts[0]), float(parts[1])))
+        for entry in text.replace(";", " ").split():
+            parts = entry.split(",")
+            if len(parts) != 2:
+                raise SystemExit(
+                    f"--slices entries must be vx,vy (got {entry!r})"
+                )
+            slices.append((float(parts[0]), float(parts[1])))
     return slices
 
 
@@ -521,8 +534,10 @@ if __name__ == "__main__":
         nargs="+",
         default=None,
         metavar="VX,VY",
-        help="Velocity slices to compare, e.g. --slices 0,0 1,0 0,1 "
-             "(default: rest plus 1 m/s along each axis)",
+        help="Velocity slices to compare, e.g. --slices 0,0 1,0 0,1, or one "
+             "quoted argument when negative speeds are included: "
+             "--slices \"0,0 2,0 -2,0\" (default: rest plus 1 m/s along each "
+             "axis)",
     )
     parser.add_argument(
         "--save-json",

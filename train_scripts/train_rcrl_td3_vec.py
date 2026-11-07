@@ -61,15 +61,18 @@ INJECT_MAX_SPEED = 2.5
 INJECTION_BUFFER_SIZE = 100_000
 
 
-def replay_buffer_stats(buffer, sample_size=65_536):
+def replay_buffer_stats(buffer, sample_size=65_536, speed_scale=1.0):
     """Distribution of the transitions currently in the replay buffer.
 
     The stored observation starts with the velocity (2 components), so
-    speed is the norm of the first two state components. Reports the
-    share of transitions in the near-boundary, fast, and combined
-    danger region, plus the violation share and means, to diagnose
-    whether the safety critic is data-starved where it is least accurate.
-    Draws a random subsample when the buffer is larger than sample_size.
+    speed is the norm of the first two state components times
+    ``speed_scale``. With normalized observations that scale is the speed
+    limit (``obs_scale``), otherwise 1; without it the thresholds below,
+    which are in m/s, never fire. Reports the share of transitions in the
+    near-boundary, fast, and combined danger region, plus the violation
+    share and means, to diagnose whether the safety critic is data-starved
+    where it is least accurate. Draws a random subsample when the buffer is
+    larger than sample_size.
     """
     n = buffer.size
     if n == 0:
@@ -79,7 +82,7 @@ def replay_buffer_stats(buffer, sample_size=65_536):
         state, h = buffer.state[idx], buffer.h[idx]
     else:
         state, h = buffer.state[:n], buffer.h[:n]
-    speed = torch.linalg.vector_norm(state[:, :2], dim=1)
+    speed = torch.linalg.vector_norm(state[:, :2], dim=1) * speed_scale
     clearance = -h[:, 0]
     near = clearance < REPLAY_NEAR_CLEARANCE
     fast = speed > REPLAY_FAST_SPEED
@@ -547,7 +550,13 @@ def main(args):
                     "steps_per_second": env_steps_done / elapsed,
                     "random_train_phase": int(random_phase),
                 }
-                log_metrics.update(replay_buffer_stats(replay_buffer))
+                log_metrics.update(replay_buffer_stats(
+                    replay_buffer,
+                    speed_scale=(
+                        float(envs[0].obs_scale[0])
+                        if args.normalize_obs else 1.0
+                    ),
+                ))
                 if injection_buffer is not None:
                     log_metrics.update(injection_buffer_stats(injection_buffer))
                 log_metrics.update(lambda_metrics(lambda_stats))
