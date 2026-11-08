@@ -32,6 +32,14 @@ Usage:
     # entries like -1,0:
     python evaluation_scripts/evaluate_feasibility.py --name my_rcrl_run \
         --slices "0,0 2,0 -2,0 0,2 0,-2"
+    # Report low- and high-speed averages separately as well as combined:
+    python evaluation_scripts/evaluate_feasibility.py --name my_rcrl_run \
+        --slices "0,0 1,0 -1,0 0,1 0,-1 2,0 -2,0 0,2 0,-2" \
+        --slice-groups low:5 high:4
+
+``--slice-groups`` labels consecutive slices (``NAME:COUNT``) so the table
+and the JSON report also show a separate average per group next to the
+per-slice rows and the overall (combined) row.
 """
 
 import argparse
@@ -90,6 +98,36 @@ def parse_slices(values):
                 )
             slices.append((float(parts[0]), float(parts[1])))
     return slices
+
+
+def parse_slice_groups(values, slice_count):
+    """Parse ``--slice-groups`` entries of the form ``name:count``.
+
+    The counts partition the ``--slices`` list in order, so
+    ``--slice-groups low:5 high:13`` labels the first five slices ``low``
+    and the next thirteen ``high``.
+    """
+    if values is None:
+        return []
+    groups = []
+    total = 0
+    for text in values:
+        name, separator, count_text = text.partition(":")
+        if (not separator or not name or not count_text.isdigit()
+                or int(count_text) <= 0):
+            raise SystemExit(
+                f"--slice-groups entries must be name:count with a positive "
+                f"count (got {text!r})"
+            )
+        count = int(count_text)
+        groups.append((name, count))
+        total += count
+    if total != slice_count:
+        raise SystemExit(
+            f"--slice-groups counts sum to {total} but {slice_count} slices "
+            "were given"
+        )
+    return groups
 
 
 def sample_goals(env, count, margin):
@@ -313,6 +351,16 @@ def print_table(slices, layout_results, aggregate):
             f"{_rate(mean['true_safe_fraction']):>14} "
             f"{_rate(mean['learned_safe_fraction']):>17}"
         )
+    for name, group in aggregate.get("groups", {}).items():
+        mean = group["mean"]
+        label = f"{name} ({group['count']})"
+        print(
+            f"{label:<14.14} {_number(mean['iou']):>7} "
+            f"{_rate(mean['false_safe_rate']):>11} "
+            f"{_rate(mean['false_unsafe_rate']):>13} "
+            f"{_rate(mean['true_safe_fraction']):>14} "
+            f"{_rate(mean['learned_safe_fraction']):>17}"
+        )
     mean = aggregate["overall"]
     print("-" * len(header))
     print(
@@ -404,6 +452,7 @@ def main(args):
                 )
 
     slices = parse_slices(args.slices)
+    slice_groups = parse_slice_groups(args.slice_groups, len(slices))
     for velocity in slices:
         if np.hypot(*velocity) > env.dynamics.max_velocity + 1e-6:
             raise SystemExit(
@@ -421,30 +470,45 @@ def main(args):
 
     layout_results = []
     figure_data = None
-    all_entries = []
+    slice_entries = [[] for _ in slices]
     for offset, layout_index in enumerate(layout_indices):
         entry, xs, ys, domain, learned_maps, true_maps = evaluate_layout(
             policy, env, args.layout_type, layout_index, slices, args,
             goal_margin, seed=args.seed + offset,
         )
         layout_results.append(entry)
-        for slice_result in entry["slices"]:
-            all_entries.append(slice_result["per_goal"])
+        for index, slice_result in enumerate(entry["slices"]):
+            slice_entries[index].extend(slice_result["per_goal"])
         if figure_data is None:
             figure_data = (entry, xs, ys, domain, learned_maps, true_maps,
                            entry["goals"])
 
-    # Per-slice aggregate over every (layout, goal) pair, plus an overall row.
-    aggregate = {"slices": {}, "overall": average_metrics(
-        [metrics for entries in all_entries for metrics in entries]
-    )}
-    for index in range(len(slices)):
+    # Per-slice aggregate over every (layout, goal) pair, optional named
+    # groups of consecutive slices (e.g. low vs high speed), and an overall
+    # row that pools all of them.
+    aggregate = {
+        "slices": {
+            str(index): average_metrics(entries)
+            for index, entries in enumerate(slice_entries)
+        },
+        "groups": {},
+        "overall": average_metrics(
+            [metrics for entries in slice_entries for metrics in entries]
+        ),
+    }
+    start = 0
+    for name, count in slice_groups:
         entries = [
             metrics
-            for layout_entry in layout_results
-            for metrics in layout_entry["slices"][index]["per_goal"]
+            for slice_entries_in_group in slice_entries[start:start + count]
+            for metrics in slice_entries_in_group
         ]
-        aggregate["slices"][str(index)] = average_metrics(entries)
+        aggregate["groups"][name] = {
+            "count": count,
+            "slice_indices": list(range(start, start + count)),
+            "mean": average_metrics(entries),
+        }
+        start += count
 
     print_table(slices, layout_results, aggregate)
 
@@ -538,6 +602,16 @@ if __name__ == "__main__":
              "quoted argument when negative speeds are included: "
              "--slices \"0,0 2,0 -2,0\" (default: rest plus 1 m/s along each "
              "axis)",
+    )
+    parser.add_argument(
+        "--slice-groups",
+        nargs="+",
+        default=None,
+        metavar="NAME:COUNT",
+        help="Named groups of consecutive --slices entries, reported as "
+             "separate averages in addition to the per-slice values and the "
+             "overall row, e.g. --slice-groups low:5 high:13. The counts must "
+             "partition the slice list in order",
     )
     parser.add_argument(
         "--save-json",
