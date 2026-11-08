@@ -80,7 +80,7 @@ def _json_safe(value):
 
 def save_evaluation_json(path, results, config, run_dir, layout_set,
                          normalize_obs, safety_margin, reward_scale,
-                         min_start_goal_distance):
+                         min_start_goal_distance, max_steps=None):
     """Write an evaluation report, including per-episode arrays, as JSON.
 
     The per-episode arrays use the same seeded start/goal pairs across runs,
@@ -96,6 +96,7 @@ def save_evaluation_json(path, results, config, run_dir, layout_set,
         "layout_type": "test",
         "normalize_obs": bool(normalize_obs),
         "episodes_per_layout": int(results["episodes_per_layout"]),
+        "max_steps": None if max_steps is None else int(max_steps),
         "safety_margin": float(safety_margin),
         "observation_lidar_shift": float(
             results.get("observation_lidar_shift", 0.0)
@@ -155,7 +156,7 @@ def save_evaluation_json(path, results, config, run_dir, layout_set,
 
 def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
          safety_margin=None, reward_scale=None, min_start_goal_distance=None,
-         save_json=None):
+         save_json=None, max_steps=None):
     config = load_config(run_dir)
 
     # The reward divisor is a property of the run. Checkpoints trained before
@@ -165,10 +166,17 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
     if reward_scale is None:
         reward_scale = config.get("reward_scale", 1.0)
 
+    # The step cap is normally the run's own maximum episode length. It can be
+    # raised at evaluation time to test how much of the timeout share is
+    # finishing speed rather than failure to navigate.
+    if max_steps is None:
+        max_steps = config.get("max_steps", 150)
+
     env = create_env(
         layout_set,
         normalize_obs=normalize_obs,
         reward_scale=reward_scale,
+        max_steps=max_steps,
     )
     if safety_margin is None:
         safety_margin = env.vehicle_radius
@@ -217,7 +225,7 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
         min_start_goal_distance=min_start_goal_distance,
         safety_margin=safety_margin,
         reward_scale=reward_scale,
-        max_steps=config.get("max_steps", 150),
+        max_steps=max_steps,
     )
 
     layout_indices = results["layout_indices"]
@@ -269,6 +277,7 @@ def main(run_dir, layout_set="one", normalize_obs=True, episodes_per_layout=20,
             safety_margin,
             reward_scale,
             min_start_goal_distance,
+            max_steps=max_steps,
         )
         print(f"Saved JSON: {save_json}")
 
@@ -308,6 +317,14 @@ if __name__ == "__main__":
         default=20,
         help="Episodes with sampled start/goal pairs to run on each test "
              "layout (default: 20)",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Override the run's recorded episode step cap (config.json "
+             "max_steps) for this evaluation. Raising it converts some "
+             "timeouts into successes and makes caps comparable across runs",
     )
     parser.add_argument(
         "--safety-margin",
@@ -352,6 +369,8 @@ if __name__ == "__main__":
     if (args.min_start_goal_distance is not None
             and args.min_start_goal_distance < 0):
         parser.error("--min-start-goal-distance must be nonnegative")
+    if args.max_steps is not None and args.max_steps < 1:
+        parser.error("--max-steps must be positive")
 
     run_dir = os.path.join("models", args.name)
 
@@ -364,4 +383,5 @@ if __name__ == "__main__":
         reward_scale=args.reward_scale,
         min_start_goal_distance=args.min_start_goal_distance,
         save_json=args.save_json,
+        max_steps=args.max_steps,
     )

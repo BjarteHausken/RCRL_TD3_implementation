@@ -311,6 +311,65 @@ class CorridorEnvironment(gym.Env):
             "obstructed for the requested margin"
         )
 
+    def sample_goal_near(self, position, max_distance=1.0, margin=0.3,
+                         max_attempts=1000):
+        """Sample a feasible goal position within ``max_distance`` of ``position``.
+
+        The bearing is uniform and the distance is uniform between one goal
+        radius (so the goal is not already reached at reset) and
+        ``max_distance``. A candidate goal must keep ``margin`` clearance
+        from the walls and ``pillar_radius + vehicle_radius + margin`` from
+        every pillar centre, the same rule ``sample_random_state`` uses, so
+        it is feasible on the currently loaded layout.
+
+        ``position`` is a state (x, x_dot, y, y_dot) or a position (x, y).
+        Returns None when no feasible candidate was found within
+        ``max_attempts`` draws, which can happen when the start is boxed in
+        by pillars and walls; callers then fall back to a uniformly sampled
+        goal.
+
+        Used by the random training phase to start episodes close to the
+        goal: the last metre before the goal is otherwise only visited at
+        the end of successful episodes, which leaves the actor without
+        enough data there to learn the final approach.
+        """
+        position = np.asarray(position, dtype=np.float64).reshape(-1)
+        if position.size >= 4:
+            start_x, start_y = position[0], position[2]
+        else:
+            start_x, start_y = position[0], position[1]
+        if max_distance <= self.goal_radius:
+            raise ValueError(
+                "max_distance must exceed the goal radius "
+                f"({self.goal_radius:.2f} m); got {max_distance:.2f} m"
+            )
+        if getattr(self, "np_random", None) is None:
+            self.np_random = np.random.default_rng()
+
+        half_width = self.width / 2
+        wall_margin = self.vehicle_radius + margin
+
+        for _ in range(max_attempts):
+            distance = self.np_random.uniform(self.goal_radius, max_distance)
+            angle = 2.0 * np.pi * self.np_random.uniform()
+            x = start_x + distance * np.cos(angle)
+            y = start_y + distance * np.sin(angle)
+
+            if not wall_margin <= x <= self.length - wall_margin:
+                continue
+            if not -half_width + wall_margin <= y <= half_width - wall_margin:
+                continue
+            pillar_clear = all(
+                np.hypot(x - pillar_x, y - pillar_y)
+                >= pillar_radius + self.vehicle_radius + margin
+                for pillar_x, pillar_y, pillar_radius in self.pillars
+            )
+            if not pillar_clear:
+                continue
+            return np.array([x, y], dtype=np.float64)
+
+        return None
+
     def sample_danger_state(
         self,
         min_clearance=0.05,

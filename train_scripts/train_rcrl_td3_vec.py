@@ -118,7 +118,8 @@ def injection_buffer_stats(buffer):
     }
 
 
-def random_train_reset(env, min_speed, seed=None):
+def random_train_reset(env, min_speed, goal_distance=None,
+                       near_goal_fraction=0.0, seed=None):
     """Reset into a uniformly random free-corridor state with nonzero speed.
 
     Used during the random phase (``--random-train-fraction``): the state
@@ -127,8 +128,18 @@ def random_train_reset(env, min_speed, seed=None):
     replay buffer sees every part of the map, including the fast
     near-obstacle states normal training rarely visits. The layout is
     selected before the state is sampled, so the state is valid for the
-    geometry the episode runs on; the goal is sampled by the second reset
-    and is uniformly random, without a minimum start-goal distance.
+    geometry the episode runs on.
+
+    ``near_goal_fraction`` splits the random phase between two goal
+    regimes: with that probability the goal is placed within
+    ``goal_distance`` of the start (between one goal radius and that
+    distance, uniformly), so the episode begins in the last metre before
+    the goal, where the actor otherwise parks; otherwise the goal is
+    sampled uniformly over the corridor, which is what gives the random
+    phase its uniform coverage of the goal-relative observations. Making
+    every episode near-goal would throw that coverage away, so the default
+    is a split rather than either extreme. A nonpositive ``goal_distance``
+    keeps a uniformly random goal for every episode.
     """
     env.reset(layout_type="train", seed=seed)
     state = env.sample_random_state(
@@ -136,7 +147,14 @@ def random_train_reset(env, min_speed, seed=None):
         max_speed=env.dynamics.max_velocity,
         min_speed=min_speed,
     )
-    return env.reset(state=state, layout_type="fixed")
+    goal = None
+    if (goal_distance is not None and goal_distance > 0.0
+            and near_goal_fraction > 0.0
+            and env.np_random.random() < near_goal_fraction):
+        goal = env.sample_goal_near(state, max_distance=goal_distance)
+    if goal is None:
+        return env.reset(state=state, layout_type="fixed")
+    return env.reset(state=state, goal=goal, layout_type="fixed")
 
 
 def collect_injection_transitions(policy, env, count,
@@ -269,6 +287,13 @@ def main(args):
         raise ValueError(
             "--random-train-min-speed must not exceed the dynamics max_velocity"
         )
+    if (args.random_train_goal_distance > 0.0
+            and args.random_train_goal_distance <= envs[0].goal_radius):
+        raise ValueError(
+            "--random-train-goal-distance must exceed the goal radius "
+            f"({envs[0].goal_radius:.2f} m) when nonzero, so the sampled "
+            "episode does not start with the goal already reached"
+        )
     replay_buffer = ReplayBufferRCRLTD3Torch(
         state_dim,
         action_dim,
@@ -352,7 +377,11 @@ def main(args):
         # whenever it is enabled.
         if args.random_train_fraction > 0.0:
             observation, _ = random_train_reset(
-                env, args.random_train_min_speed, seed=args.seed + i
+                env,
+                args.random_train_min_speed,
+                goal_distance=args.random_train_goal_distance,
+                near_goal_fraction=args.random_train_near_goal_fraction,
+                seed=args.seed + i,
             )
         else:
             observation, _ = episode_reset(
@@ -457,7 +486,12 @@ def main(args):
                     window_steps += int(episode_steps[i])
                     if random_phase:
                         observation, _ = random_train_reset(
-                            env, args.random_train_min_speed
+                            env,
+                            args.random_train_min_speed,
+                            goal_distance=args.random_train_goal_distance,
+                            near_goal_fraction=(
+                                args.random_train_near_goal_fraction
+                            ),
                         )
                     else:
                         observation, _ = episode_reset(
@@ -870,6 +904,24 @@ def parse_args():
                              "sampled during --random-train-fraction; the "
                              "maximum is the dynamics' max_velocity "
                              "(default 1.0, guaranteeing nonzero velocity)")
+    parser.add_argument("--random-train-goal-distance", type=float, default=1.0,
+                        help="Maximum start-goal distance (m) of the "
+                             "near-goal share of --random-train-fraction "
+                             "episodes: the goal is placed uniformly "
+                             "between one goal radius and this distance "
+                             "from the sampled start, so those episodes "
+                             "cover the last metre before the goal where "
+                             "the actor otherwise parks. 0 disables the "
+                             "near-goal share and samples every goal "
+                             "uniformly over the corridor (default: 1.0)")
+    parser.add_argument("--random-train-near-goal-fraction", type=float,
+                        default=0.5,
+                        help="Fraction of --random-train-fraction episodes "
+                             "that get the near goal from "
+                             "--random-train-goal-distance; the rest keep a "
+                             "uniformly sampled goal, which preserves the "
+                             "random phase's uniform coverage of the "
+                             "goal-relative observations (default: 0.5)")
     parser.add_argument("--min-start-goal-distance", type=float, default=None,
                         help="Minimum start-goal distance (m) for sampled "
                              "episodes; default is 2 * goal_radius (1.0 m). "
@@ -958,6 +1010,12 @@ def parse_args():
         parser.error("--random-train-fraction must be between 0 and 1")
     if args.random_train_min_speed <= 0:
         parser.error("--random-train-min-speed must be positive")
+    if args.random_train_goal_distance < 0:
+        parser.error("--random-train-goal-distance must be nonnegative")
+    if not 0.0 <= args.random_train_near_goal_fraction <= 1.0:
+        parser.error(
+            "--random-train-near-goal-fraction must be between 0 and 1"
+        )
     if (args.min_start_goal_distance is not None
             and args.min_start_goal_distance < 0):
         parser.error("--min-start-goal-distance must be nonnegative")

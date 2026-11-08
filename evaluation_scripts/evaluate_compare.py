@@ -35,7 +35,8 @@ from environment import create_env
 from evaluation_scripts.evaluation import evaluate_policy
 
 
-def evaluate_run(run_dir, episodes_per_layout, safety_margin=None):
+def evaluate_run(run_dir, episodes_per_layout, safety_margin=None,
+                 max_steps=None):
     """Evaluate one run with its own recorded settings.
 
     ``safety_margin`` is an evaluation-only runtime clearance threshold: the
@@ -52,7 +53,12 @@ def evaluate_run(run_dir, episodes_per_layout, safety_margin=None):
     config["layout_set"] = config.get("layout_set") or "one"
     config["normalize_obs"] = config.get("normalize_obs", True)
     config["reward_scale"] = config.get("reward_scale", 1.0)
-    config["max_steps"] = config.get("max_steps", 150)
+    # The step cap is the run's own by default; an explicit override makes
+    # caps comparable across families (100 vs 150) and shows how much of the
+    # timeout share converts into successes with a longer clock.
+    if max_steps is None:
+        max_steps = config.get("max_steps", 150)
+    config["max_steps"] = max_steps
     layout_set = config["layout_set"]
     normalize_obs = config["normalize_obs"]
     reward_scale = config["reward_scale"]
@@ -429,7 +435,7 @@ def save_comparison_json(path, entries, episodes_per_layout):
 
 
 def main(names, episodes_per_layout=20, save_json=None, save_png=None,
-         save_layout_png=None, safety_margin=None):
+         save_layout_png=None, safety_margin=None, max_steps=None):
     if len(names) < 2:
         raise SystemExit("Pass at least two run names to compare")
 
@@ -440,7 +446,8 @@ def main(names, episodes_per_layout=20, save_json=None, save_png=None,
             raise SystemExit(f"Run directory not found: {run_dir}")
         print(f"=== Evaluating {name} ===")
         config, results = evaluate_run(
-            run_dir, episodes_per_layout, safety_margin=safety_margin
+            run_dir, episodes_per_layout, safety_margin=safety_margin,
+            max_steps=max_steps,
         )
         entries.append((name, config, results))
         num = len(results["rewards"])
@@ -496,6 +503,15 @@ if __name__ == "__main__":
              "metric) to PATH, for use in presentations",
     )
     parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Override every run's episode step cap for this comparison "
+             "(default: each run's config.json max_steps). Raising it makes "
+             "the 100- and 150-step families comparable and converts some "
+             "timeouts into successes",
+    )
+    parser.add_argument(
         "--safety-margin",
         type=float,
         default=None,
@@ -519,6 +535,8 @@ if __name__ == "__main__":
 
     if args.episodes_per_layout < 1:
         parser.error("--episodes-per-layout must be positive")
+    if args.max_steps is not None and args.max_steps < 1:
+        parser.error("--max-steps must be positive")
 
     main(
         args.names,
@@ -527,4 +545,5 @@ if __name__ == "__main__":
         save_png=args.save_png,
         save_layout_png=args.save_layout_png,
         safety_margin=args.safety_margin,
+        max_steps=args.max_steps,
     )
