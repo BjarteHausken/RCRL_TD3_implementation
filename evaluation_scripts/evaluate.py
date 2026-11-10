@@ -38,6 +38,20 @@ def agent_type_from_config(config, run_dir):
     return agent_type
 
 
+def lidar_encoder_kwargs(config):
+    """Encoder arguments recorded in a run's ``config.json``.
+
+    Runs trained before the encoder existed have no ``lidar_encoder`` key and
+    must be reconstructed with the raw-lidar MLP, so the flag defaults to
+    ``False`` here even though new training enables the encoder by default.
+    """
+    return {
+        "lidar_encoder": bool(config.get("lidar_encoder", False)),
+        "lidar_embed_dim": config.get("lidar_embed_dim", 16),
+        "num_lidar_rays": config.get("num_lidar_rays", 64),
+    }
+
+
 def build_policy(run_dir, config, state_dim, action_dim, max_action):
     """Reconstruct the agent a run was trained with and load its checkpoint.
 
@@ -45,8 +59,9 @@ def build_policy(run_dir, config, state_dim, action_dim, max_action):
     ``agent`` field of ``config.json`` also locates the weights.
     """
     agent_type = agent_type_from_config(config, run_dir)
+    encoder_kwargs = lidar_encoder_kwargs(config)
     if agent_type == "td3":
-        policy = TD3(state_dim, action_dim, max_action)
+        policy = TD3(state_dim, action_dim, max_action, **encoder_kwargs)
     else:
         # Agent hyperparameters are a property of the checkpoint, not of the
         # evaluation: reconstruct the agent the run was trained with.
@@ -60,6 +75,7 @@ def build_policy(run_dir, config, state_dim, action_dim, max_action):
             min_lambda=config.get("min_lambda", 0.0),
             safety_twin=config.get("safety_twin", False),
             safety_aggregation=config.get("safety_aggregation", "min"),
+            **encoder_kwargs,
         )
     policy.load(os.path.join(run_dir, agent_type))
     return policy

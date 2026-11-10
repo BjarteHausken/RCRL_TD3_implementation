@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .encoders import LidarStateEncoder
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -20,37 +22,49 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action):
+    def __init__(self, state_dim, action_dim, max_action, encoder=None):
         super(Actor, self).__init__()
 
-        self.l1 = nn.Linear(state_dim, 256)
+        self.encoder = encoder
+        input_dim = encoder.input_dim if encoder is not None else state_dim
+        self.l1 = nn.Linear(input_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.l3 = nn.Linear(256, action_dim)
 
         self.max_action = max_action
 
+    def _encode_state(self, state):
+        return state if self.encoder is None else self.encoder(state)
+
     def forward(self, state):
-        a = F.elu(self.l1(state))
+        a = F.elu(self.l1(self._encode_state(state)))
         a = F.elu(self.l2(a))
         return self.max_action * torch.tanh(self.l3(a))
 
 
 class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, encoder=None):
         super(Critic, self).__init__()
 
+        self.encoder = encoder
+        input_dim = encoder.input_dim if encoder is not None else state_dim
+
         # Q1 architecture
-        self.l1 = nn.Linear(state_dim + action_dim, 256)
+        self.l1 = nn.Linear(input_dim + action_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.l3 = nn.Linear(256, 1)
 
         # Q2 architecture
-        self.l4 = nn.Linear(state_dim + action_dim, 256)
+        self.l4 = nn.Linear(input_dim + action_dim, 256)
         self.l5 = nn.Linear(256, 256)
         self.l6 = nn.Linear(256, 1)
 
+    def _state_action(self, state, action):
+        state = state if self.encoder is None else self.encoder(state)
+        return torch.cat([state, action], 1)
+
     def forward(self, state, action):
-        sa = torch.cat([state, action], 1)
+        sa = self._state_action(state, action)
 
         q1 = F.elu(self.l1(sa))
         q1 = F.elu(self.l2(q1))
@@ -62,7 +76,7 @@ class Critic(nn.Module):
         return q1, q2
 
     def Q1(self, state, action):
-        sa = torch.cat([state, action], 1)
+        sa = self._state_action(state, action)
 
         q1 = F.elu(self.l1(sa))
         q1 = F.elu(self.l2(q1))
@@ -87,9 +101,16 @@ class TD3(object):
         actor_lr_final=1e-6,
         anneal_steps=None,
         grad_clip=1.0,
+        lidar_encoder=False,
+        lidar_embed_dim=16,
+        num_lidar_rays=64,
     ):
         if grad_clip < 0:
             raise ValueError("grad_clip must be nonnegative")
+        if lidar_embed_dim < 1:
+            raise ValueError("lidar_embed_dim must be positive")
+        if num_lidar_rays < 1:
+            raise ValueError("num_lidar_rays must be positive")
         for name, lr in (
             ("critic_lr", critic_lr),
             ("actor_lr", actor_lr),
@@ -103,14 +124,26 @@ class TD3(object):
 
         # Adam betas from the paper's Table 1.
         self.adam_betas = (0.99, 0.999)
+        # Each network owns its encoder, so its lidar features are trained by
+        # that network's own loss and its target copy stays independent.
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.lidar_encoder = bool(lidar_encoder)
+        self.lidar_embed_dim = int(lidar_embed_dim)
+        self.num_lidar_rays = int(num_lidar_rays)
 
-        self.actor = Actor(state_dim, action_dim, max_action).to(device)
+        self.actor = Actor(
+            state_dim, action_dim, max_action,
+            encoder=self._make_state_encoder(),
+        ).to(device)
         self.actor_target = copy.deepcopy(self.actor)
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(), lr=actor_lr, betas=self.adam_betas
         )
 
-        self.critic = Critic(state_dim, action_dim).to(device)
+        self.critic = Critic(
+            state_dim, action_dim, encoder=self._make_state_encoder()
+        ).to(device)
         self.critic_target = copy.deepcopy(self.critic)
         self.critic_optimizer = torch.optim.Adam(
             self.critic.parameters(), lr=critic_lr, betas=self.adam_betas
@@ -134,6 +167,16 @@ class TD3(object):
         self.anneal_steps = None if anneal_steps is None else int(anneal_steps)
 
         self.total_it = 0
+
+    def _make_state_encoder(self):
+        """A fresh lidar encoder for one network, or ``None`` when disabled."""
+        if not self.lidar_encoder:
+            return None
+        return LidarStateEncoder(
+            state_dim=self.state_dim,
+            num_lidar_rays=self.num_lidar_rays,
+            embed_dim=self.lidar_embed_dim,
+        )
 
     def select_action(self, state):
         state = torch.FloatTensor(state.reshape(1, -1)).to(device)

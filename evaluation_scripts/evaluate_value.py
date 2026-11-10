@@ -670,7 +670,11 @@ def main(
 
     from agents.rcrl_td3 import RCRLTD3
     from environment import create_env
-    from evaluation_scripts.evaluate import agent_type_from_config, load_config
+    from evaluation_scripts.evaluate import (
+        agent_type_from_config,
+        lidar_encoder_kwargs,
+        load_config,
+    )
 
     config = load_config(run_dir)
     agent_type = agent_type_from_config(config, run_dir)
@@ -739,6 +743,7 @@ def main(
         min_lambda=config.get("min_lambda", 0.0),
         safety_twin=config.get("safety_twin", False),
         safety_aggregation=config.get("safety_aggregation", "min"),
+        **lidar_encoder_kwargs(config),
     )
     policy.load(model_path)
     policy.actor.eval()

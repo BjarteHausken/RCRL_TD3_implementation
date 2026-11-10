@@ -278,6 +278,9 @@ def main(args):
         safety_twin=args.safety_twin,
         safety_aggregation=args.safety_aggregation,
         safety_inject_mix=args.safety_inject_mix,
+        lidar_encoder=args.lidar_encoder,
+        lidar_embed_dim=args.lidar_embed_dim,
+        num_lidar_rays=envs[0].num_lidar_rays,
     )
     if args.random_reset_max_speed > envs[0].dynamics.max_velocity:
         raise ValueError(
@@ -701,6 +704,28 @@ def parse_args():
         action="store_false",
         help="Disable observation scaling",
     )
+    parser.add_argument(
+        "--lidar-encoder",
+        dest="lidar_encoder",
+        action="store_true",
+        default=True,
+        help="Encode the lidar block with a two-layer circular 1-D CNN before "
+             "the MLP networks (default); evaluation reads the setting back "
+             "from config.json",
+    )
+    parser.add_argument(
+        "--no-lidar-encoder",
+        dest="lidar_encoder",
+        action="store_false",
+        help="Feed the raw lidar rays to the MLPs (the pre-encoder behaviour)",
+    )
+    parser.add_argument(
+        "--lidar-embed-dim",
+        type=int,
+        default=16,
+        help="Number of angular bins the lidar encoder produces (default 16); "
+             "with 64 rays and stride 4 only 16 bins reproduce the ray count",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-timesteps", type=int, default=30_000)
     parser.add_argument("--batch-size", type=int, default=512)
@@ -1025,6 +1050,8 @@ def parse_args():
         parser.error("--eval-episodes-per-layout must be positive")
     if args.save_freq < 0:
         parser.error("--save-freq must be nonnegative")
+    if args.lidar_embed_dim < 1:
+        parser.error("--lidar-embed-dim must be positive")
     return args
 
 

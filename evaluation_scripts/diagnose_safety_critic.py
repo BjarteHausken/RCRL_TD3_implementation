@@ -59,9 +59,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from agents.encoders import LidarStateEncoder
 from agents.rcrl_td3 import SafetyCritic, SafetyCriticTwin
 from environment import create_env, step_batch
-from evaluation_scripts.evaluate import build_policy, load_config
+from evaluation_scripts.evaluate import (
+    build_policy,
+    lidar_encoder_kwargs,
+    load_config,
+)
 
 BIN_EDGES = (-np.inf, -0.2, 0.0, np.inf)
 BIN_NAMES = ("deep_safe", "near_boundary", "positive")
@@ -899,8 +904,20 @@ def main(args):
             if config.get("safety_twin", False)
             else SafetyCritic
         )
+        # The lidar encoder is part of the architecture, so a scratch critic
+        # trained without one would not be comparable to the checkpoint's.
+        encoder_settings = lidar_encoder_kwargs(config)
+        scratch_encoder = None
+        if encoder_settings["lidar_encoder"]:
+            scratch_encoder = LidarStateEncoder(
+                state_dim=env.observation_space.shape[0],
+                num_lidar_rays=encoder_settings["num_lidar_rays"],
+                embed_dim=encoder_settings["lidar_embed_dim"],
+            )
         scratch_critic = scratch_critic_class(
-            env.observation_space.shape[0], env.action_space.shape[0]
+            env.observation_space.shape[0],
+            env.action_space.shape[0],
+            encoder=scratch_encoder,
         ).to(device)
         scratch_final, scratch_history, scratch_optimizer = train_critic(
             scratch_critic, data, train_mask, val_mask, settings, args,

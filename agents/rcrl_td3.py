@@ -8,20 +8,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .encoders import LidarStateEncoder
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action):
+    def __init__(self, state_dim, action_dim, max_action, encoder=None):
         super().__init__()
-        self.l1 = nn.Linear(state_dim, 256)
+        self.encoder = encoder
+        input_dim = encoder.input_dim if encoder is not None else state_dim
+        self.l1 = nn.Linear(input_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.l3 = nn.Linear(256, action_dim)
         self.max_action = max_action
 
+    def _encode_state(self, state):
+        return state if self.encoder is None else self.encoder(state)
+
     def forward(self, state):
-        action = F.elu(self.l1(state))
+        action = F.elu(self.l1(self._encode_state(state)))
         action = F.elu(self.l2(action))
         return self.max_action * torch.tanh(self.l3(action))
 
@@ -29,17 +36,23 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     """Twin reward critic used by TD3."""
 
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, encoder=None):
         super().__init__()
-        self.l1 = nn.Linear(state_dim + action_dim, 256)
+        self.encoder = encoder
+        input_dim = encoder.input_dim if encoder is not None else state_dim
+        self.l1 = nn.Linear(input_dim + action_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.l3 = nn.Linear(256, 1)
-        self.l4 = nn.Linear(state_dim + action_dim, 256)
+        self.l4 = nn.Linear(input_dim + action_dim, 256)
         self.l5 = nn.Linear(256, 256)
         self.l6 = nn.Linear(256, 1)
 
+    def _state_action(self, state, action):
+        state = state if self.encoder is None else self.encoder(state)
+        return torch.cat([state, action], dim=1)
+
     def forward(self, state, action):
-        state_action = torch.cat([state, action], dim=1)
+        state_action = self._state_action(state, action)
         q1 = F.elu(self.l1(state_action))
         q1 = F.elu(self.l2(q1))
         q1 = self.l3(q1)
@@ -49,7 +62,7 @@ class Critic(nn.Module):
         return q1, q2
 
     def q1(self, state, action):
-        state_action = torch.cat([state, action], dim=1)
+        state_action = self._state_action(state, action)
         q1 = F.elu(self.l1(state_action))
         q1 = F.elu(self.l2(q1))
         return self.l3(q1)
@@ -58,14 +71,20 @@ class Critic(nn.Module):
 class SafetyCritic(nn.Module):
     """Single RCRL safety-value critic, where positive values are unsafe."""
 
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, encoder=None):
         super().__init__()
-        self.l1 = nn.Linear(state_dim + action_dim, 256)
+        self.encoder = encoder
+        input_dim = encoder.input_dim if encoder is not None else state_dim
+        self.l1 = nn.Linear(input_dim + action_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.l3 = nn.Linear(256, 1)
 
+    def _state_action(self, state, action):
+        state = state if self.encoder is None else self.encoder(state)
+        return torch.cat([state, action], dim=1)
+
     def forward(self, state, action):
-        state_action = torch.cat([state, action], dim=1)
+        state_action = self._state_action(state, action)
         value = F.elu(self.l1(state_action))
         value = F.elu(self.l2(value))
         return self.l3(value)
@@ -83,17 +102,23 @@ class SafetyCriticTwin(nn.Module):
     logging, matching how the reward side uses ``Critic.q1``.
     """
 
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, encoder=None):
         super().__init__()
-        self.l1 = nn.Linear(state_dim + action_dim, 256)
+        self.encoder = encoder
+        input_dim = encoder.input_dim if encoder is not None else state_dim
+        self.l1 = nn.Linear(input_dim + action_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.l3 = nn.Linear(256, 1)
-        self.l4 = nn.Linear(state_dim + action_dim, 256)
+        self.l4 = nn.Linear(input_dim + action_dim, 256)
         self.l5 = nn.Linear(256, 256)
         self.l6 = nn.Linear(256, 1)
 
+    def _state_action(self, state, action):
+        state = state if self.encoder is None else self.encoder(state)
+        return torch.cat([state, action], dim=1)
+
     def forward(self, state, action):
-        state_action = torch.cat([state, action], dim=1)
+        state_action = self._state_action(state, action)
         value1 = F.elu(self.l1(state_action))
         value1 = F.elu(self.l2(value1))
         value1 = self.l3(value1)
@@ -103,7 +128,7 @@ class SafetyCriticTwin(nn.Module):
         return value1, value2
 
     def h1(self, state, action):
-        state_action = torch.cat([state, action], dim=1)
+        state_action = self._state_action(state, action)
         value1 = F.elu(self.l1(state_action))
         value1 = F.elu(self.l2(value1))
         return self.l3(value1)
@@ -133,9 +158,12 @@ class MultiplierNetwork(nn.Module):
     variation above it intact. ``min_lambda = 0`` reproduces the pure dual.
     """
 
-    def __init__(self, state_dim, max_lambda, initial_lambda, min_lambda=0.0):
+    def __init__(self, state_dim, max_lambda, initial_lambda, min_lambda=0.0,
+                 encoder=None):
         super().__init__()
-        self.l1 = nn.Linear(state_dim, 256)
+        self.encoder = encoder
+        input_dim = encoder.input_dim if encoder is not None else state_dim
+        self.l1 = nn.Linear(input_dim, 256)
         self.l2 = nn.Linear(256, 256)
         self.l3 = nn.Linear(256, 1)
         self.max_lambda = max_lambda
@@ -150,6 +178,8 @@ class MultiplierNetwork(nn.Module):
         nn.init.constant_(self.l3.bias, initial_logit)
 
     def forward(self, state):
+        if self.encoder is not None:
+            state = self.encoder(state)
         multiplier = F.elu(self.l1(state))
         multiplier = F.elu(self.l2(multiplier))
         values = self.min_lambda + F.softplus(self.l3(multiplier))
@@ -203,6 +233,9 @@ class RCRLTD3:
         safety_twin=False,
         safety_aggregation="min",
         safety_inject_mix=0.0,
+        lidar_encoder=False,
+        lidar_embed_dim=16,
+        num_lidar_rays=64,
     ):
         if policy_freq < 1:
             raise ValueError("policy_freq must be positive")
@@ -261,16 +294,34 @@ class RCRLTD3:
                 "network mode requires initial_lambda < max_lambda"
             )
 
+        if lidar_embed_dim < 1:
+            raise ValueError("lidar_embed_dim must be positive")
+        if num_lidar_rays < 1:
+            raise ValueError("num_lidar_rays must be positive")
+
         # The paper's Table 1 uses Adam with beta1 = 0.99, beta2 = 0.999.
         self.adam_betas = (0.99, 0.999)
+        # Each network owns its encoder, so the lidar features are trained by
+        # that network's own loss and never shared with the target copies of
+        # another module.
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.lidar_encoder = bool(lidar_encoder)
+        self.lidar_embed_dim = int(lidar_embed_dim)
+        self.num_lidar_rays = int(num_lidar_rays)
 
-        self.actor = Actor(state_dim, action_dim, max_action).to(device)
+        self.actor = Actor(
+            state_dim, action_dim, max_action,
+            encoder=self._make_state_encoder(),
+        ).to(device)
         self.actor_target = copy.deepcopy(self.actor)
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(), lr=actor_lr, betas=self.adam_betas
         )
 
-        self.critic = Critic(state_dim, action_dim).to(device)
+        self.critic = Critic(
+            state_dim, action_dim, encoder=self._make_state_encoder()
+        ).to(device)
         self.critic_target = copy.deepcopy(self.critic)
         self.critic_optimizer = torch.optim.Adam(
             self.critic.parameters(), lr=critic_lr, betas=self.adam_betas
@@ -279,9 +330,13 @@ class RCRLTD3:
         self.safety_twin = bool(safety_twin)
         self.safety_aggregation = safety_aggregation
         if self.safety_twin:
-            self.safety_critic = SafetyCriticTwin(state_dim, action_dim).to(device)
+            self.safety_critic = SafetyCriticTwin(
+                state_dim, action_dim, encoder=self._make_state_encoder()
+            ).to(device)
         else:
-            self.safety_critic = SafetyCritic(state_dim, action_dim).to(device)
+            self.safety_critic = SafetyCritic(
+                state_dim, action_dim, encoder=self._make_state_encoder()
+            ).to(device)
         self.safety_critic_target = copy.deepcopy(self.safety_critic)
         self.safety_critic_optimizer = torch.optim.Adam(
             self.safety_critic.parameters(), lr=safety_lr, betas=self.adam_betas
@@ -290,7 +345,8 @@ class RCRLTD3:
         self.multiplier_type = multiplier_type
         if multiplier_type == "network":
             self.multiplier = MultiplierNetwork(
-                state_dim, max_lambda, initial_lambda, min_lambda
+                state_dim, max_lambda, initial_lambda, min_lambda,
+                encoder=self._make_state_encoder(),
             ).to(device)
             self.multiplier_optimizer = torch.optim.Adam(
                 self.multiplier.parameters(), lr=multiplier_lr,
@@ -342,6 +398,22 @@ class RCRLTD3:
             None if safety_batch_size is None else int(safety_batch_size)
         )
         self.total_it = 0
+
+    def _make_state_encoder(self):
+        """A fresh lidar encoder for one network, or ``None`` when disabled.
+
+        Every network gets its own instance: sharing one module would let the
+        actor, critic and safety losses train a single set of lidar features
+        through different objectives, and the target copies would no longer be
+        independent.
+        """
+        if not self.lidar_encoder:
+            return None
+        return LidarStateEncoder(
+            state_dim=self.state_dim,
+            num_lidar_rays=self.num_lidar_rays,
+            embed_dim=self.lidar_embed_dim,
+        )
 
     def multiplier_for(self, state):
         """Lagrange multiplier as a (batch, 1) tensor for this state."""

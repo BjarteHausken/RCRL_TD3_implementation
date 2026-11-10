@@ -25,7 +25,11 @@ from PIL import Image
 from agents.td3 import TD3
 from agents.rcrl_td3 import RCRLTD3
 from environment import create_env
-from evaluation_scripts.evaluate import agent_type_from_config, load_config
+from evaluation_scripts.evaluate import (
+    agent_type_from_config,
+    lidar_encoder_kwargs,
+    load_config,
+)
 from evaluation_scripts.evaluation import _inflate_lidar
 
 
@@ -33,6 +37,7 @@ def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
                output=None, gif_max_width=900, safety_margin=None):
     config = load_config(run_dir)
     agent_type = agent_type_from_config(config, run_dir)
+    encoder_kwargs = lidar_encoder_kwargs(config)
     model_path = os.path.join(run_dir, agent_type)
 
     env = create_env(
@@ -56,7 +61,7 @@ def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
     max_action = float(env.action_space.high[0])
 
     if agent_type == "td3":
-        policy = TD3(state_dim, action_dim, max_action)
+        policy = TD3(state_dim, action_dim, max_action, **encoder_kwargs)
     else:
         # Agent hyperparameters are a property of the checkpoint, not of the
         # evaluation: reconstruct the agent the run was trained with.
@@ -70,6 +75,7 @@ def render_gif(run_dir, test_layout, layout_set="one", normalize_obs=True,
             min_lambda=config.get("min_lambda", 0.0),
             safety_twin=config.get("safety_twin", False),
             safety_aggregation=config.get("safety_aggregation", "min"),
+            **encoder_kwargs,
         )
     policy.load(model_path)
 

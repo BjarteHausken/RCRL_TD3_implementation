@@ -28,6 +28,13 @@ __pycache__/
 /layouts/
 /gifs/
 /results/
+/logs/
+/report/
+/runs/
+/analysis_500k/
+/docs/
+*.log
+
 
 # Local agent guidance (kept out of the public repository)
 /AGENTS.md
