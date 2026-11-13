@@ -36,8 +36,9 @@ def _wilson_interval(count, total, z=1.96):
 def _inflate_lidar(observations, shift, reference):
     """Shorten the lidar part of observations by ``shift`` metres.
 
-    The observation layout is velocity (2), lidar (``num_lidar_rays``), and
-    goal-relative position (2). Shifting the lidar makes the actor perceive
+    The observation layout is velocity (``d``), lidar (``num_lidar_rays``),
+    and goal-relative position (``d``); ``d`` is inferred from the state size
+    and is 2 for the corridor. Shifting the lidar makes the actor perceive
     every obstacle as ``shift`` metres closer, implementing the runtime
     safety margin in observation space; the environment and the evaluation
     metrics keep using the true lidar. Normalized observations store lidar
@@ -48,7 +49,10 @@ def _inflate_lidar(observations, shift, reference):
     if reference.normalize_obs:
         shift = shift / reference.lidar_range
     observations = np.array(observations, copy=True)
-    lidar = slice(2, 2 + reference.num_lidar_rays)
+    state_dim = observations.shape[-1]
+    spatial_dim = (state_dim - reference.num_lidar_rays) // 2
+    start = spatial_dim
+    lidar = slice(start, start + reference.num_lidar_rays)
     observations[..., lidar] = np.maximum(
         observations[..., lidar] - shift, 0.0
     )

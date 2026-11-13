@@ -913,6 +913,10 @@ def main(args):
                 state_dim=env.observation_space.shape[0],
                 num_lidar_rays=encoder_settings["num_lidar_rays"],
                 embed_dim=encoder_settings["lidar_embed_dim"],
+                kind=encoder_settings["lidar_encoder_kind"],
+                min_features=encoder_settings["lidar_encoder_min"],
+                ray_channels=encoder_settings["lidar_ray_channels"],
+                ray_exact_min=encoder_settings["lidar_ray_exact_min"],
             )
         scratch_critic = scratch_critic_class(
             env.observation_space.shape[0],

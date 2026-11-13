@@ -396,6 +396,50 @@ def test_min_start_goal_distance(env):
 
     print("PASS: minimum start-goal distance and infeasibility guard")
 
+def test_goal_near(env):
+    # sample_goal_near places a feasible goal inside the requested radius of
+    # a sampled start, beyond the goal radius so the episode does not start
+    # already finished; a radius at or below the goal radius is rejected.
+    margin = 0.3
+    max_distance = 1.0
+    env.reset(layout_type="train", layout_index=0, seed=0)
+    for _ in range(20):
+        state = env.sample_random_state(margin=0.0, max_speed=1.0,
+                                        min_speed=1.0)
+        goal = env.sample_goal_near(state, max_distance=max_distance,
+                                    margin=margin)
+        assert goal is not None, "no near goal found"
+        x, y = state[0], state[2]
+        goal_x, goal_y = goal
+        distance = np.hypot(x - goal_x, y - goal_y)
+        assert distance > env.goal_radius, (distance, env.goal_radius)
+        assert distance <= max_distance + 1e-9, distance
+        assert env.width / 2 - abs(goal_y) - env.vehicle_radius >= margin - 1e-6
+        assert goal_x - env.vehicle_radius - margin >= -1e-6
+        assert env.length - goal_x - env.vehicle_radius - margin >= -1e-6
+        for pillar_x, pillar_y, pillar_radius in env.pillars:
+            assert np.hypot(goal_x - pillar_x, goal_y - pillar_y) >= (
+                pillar_radius + env.vehicle_radius + margin - 1e-6
+            ), f"near goal too close to pillar: {goal_x}, {goal_y}"
+
+        # Reset onto the sampled state and goal: the episode must start
+        # unfinished and running on the same layout.
+        _, _ = env.reset(state=state, goal=goal, layout_type="fixed")
+        np.testing.assert_allclose(env.goal, goal, atol=1e-9)
+        np.testing.assert_allclose(
+            env.dynamics.get_state(), state, atol=1e-6
+        )
+        assert not env.check_collision()
+
+    try:
+        env.sample_goal_near(state, max_distance=env.goal_radius)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("max_distance at the goal radius was accepted")
+
+    print("PASS: near-goal sampling respects the radius and margins")
+
 def test_variable_layouts():
     # Generated layouts carry their own width and pillar count. reset() must
     # adopt both before sampling the start and goal, so both are feasible for
@@ -546,6 +590,312 @@ def test_back_wall(env):
     print("PASS: back wall collision and lidar")
 
 
+def test_lidar_encoder():
+    import torch
+    from agents.encoders import LidarStateEncoder
+    from agents.rcrl_td3 import Actor, Critic, MultiplierNetwork
+    from agents.td3 import TD3
+
+    num_rays = env.num_lidar_rays
+    state_dim = env.observation_space.shape[0]
+    encoder = LidarStateEncoder(state_dim, num_rays, 16)
+    assert encoder(torch.randn(4, state_dim)).shape == (4, 20)
+    # A single unbatched observation keeps its leading shape.
+    assert encoder(torch.randn(state_dim)).shape == (20,)
+
+    state = torch.randn(3, state_dim)
+    action = torch.randn(3, 2)
+    assert Actor(state_dim, 2, 1.0, encoder=LidarStateEncoder(state_dim, num_rays, 16))(
+        state
+    ).shape == (3, 2)
+    assert Critic(state_dim, 2, encoder=LidarStateEncoder(state_dim, num_rays, 16))(
+        state, action
+    )[0].shape == (3, 1)
+    assert MultiplierNetwork(
+        state_dim, 100.0, 10.0, encoder=LidarStateEncoder(state_dim, num_rays, 16)
+    )(state).shape == (3, 1)
+
+    # Checkpoints record whether the encoder was used; the encoder lives
+    # inside the agent so the config decides which state dict loads.
+    assert any(
+        key.startswith("encoder.") for key in TD3(
+            state_dim, 2, 1.0, lidar_encoder=True, num_lidar_rays=num_rays
+        ).actor.state_dict()
+    )
+    assert not any(
+        key.startswith("encoder.") for key in TD3(
+            state_dim, 2, 1.0, lidar_encoder=False
+        ).actor.state_dict()
+    )
+
+    # Structure options: the dense bottleneck control and the extra exact
+    # minimum features. Both keep the observation layout unchanged.
+    import math
+
+    linear = LidarStateEncoder(state_dim, num_rays, 16, kind="linear")
+    assert linear(torch.randn(4, state_dim)).shape == (4, 20)
+    with_min = LidarStateEncoder(state_dim, num_rays, 16, min_features=True)
+    assert with_min.input_dim == 23
+    assert with_min(torch.randn(4, state_dim)).shape == (4, 23)
+    linear_min = LidarStateEncoder(
+        state_dim, num_rays, 16, kind="linear", min_features=True
+    )
+    assert linear_min(torch.randn(4, state_dim)).shape == (4, 23)
+    # The min-feature buffer exists only when used, so the state dict of the
+    # original encoder is unchanged.
+    assert "ray_angles" not in encoder.state_dict()
+    assert "ray_angles" in with_min.state_dict()
+
+    # The extra inputs are the exact minimum range and its unit bearing.
+    lidar = torch.full((1, num_rays), 5.0)
+    lidar[0, 7] = 0.4
+    observation = torch.cat(
+        (torch.zeros(1, 2), lidar, torch.zeros(1, 2)), dim=-1
+    )
+    encoded = with_min(observation)
+    bearing = 2.0 * math.pi * 7 / num_rays
+    assert torch.isclose(encoded[0, 18], torch.tensor(0.4))
+    assert torch.isclose(encoded[0, 19], torch.tensor(math.cos(bearing)))
+    assert torch.isclose(encoded[0, 20], torch.tensor(math.sin(bearing)))
+    print("PASS: lidar encoder shapes, state-dict keys and structure options")
+
+
+def test_actor_encoder_every_step():
+    """The every-step flag moves the encoder but not the MLP head."""
+    import torch
+    from agents.rcrl_td3 import RCRLTD3
+    from agents.td3 import TD3
+    from utils.replay_buffer import (
+        ReplayBufferRCRLTD3Torch,
+        ReplayBufferTD3Torch,
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    state_dim = env.observation_space.shape[0]
+    num_rays = env.num_lidar_rays
+    batch = 64
+
+    def snapshot(module):
+        return {
+            name: parameter.detach().clone()
+            for name, parameter in module.named_parameters()
+        }
+
+    def unchanged(before, module):
+        current = dict(module.named_parameters())
+        return all(
+            torch.equal(value, current[name].detach())
+            for name, value in before.items()
+        )
+
+    def changed(before, module):
+        current = dict(module.named_parameters())
+        return any(
+            not torch.equal(value, current[name].detach())
+            for name, value in before.items()
+        )
+
+    td3 = TD3(
+        state_dim, 2, 1.0, policy_freq=4, lidar_encoder=True,
+        num_lidar_rays=num_rays, actor_encoder_every_step=True,
+    )
+    td3_buffer = ReplayBufferTD3Torch(state_dim, 2, max_size=1024, device=device)
+    td3_buffer.add_batch(
+        np.random.randn(batch, state_dim),
+        np.random.randn(batch, 2),
+        np.random.randn(batch, state_dim),
+        np.random.randn(batch),
+        np.ones(batch),
+    )
+    encoder_before = snapshot(td3.actor.encoder)
+    head_before = snapshot(td3.actor.l1)
+    td3.train(td3_buffer, batch_size=batch)  # update 1: non-policy step
+    assert changed(encoder_before, td3.actor.encoder)
+    assert unchanged(head_before, td3.actor.l1)
+    head_before = snapshot(td3.actor.l1)
+    for _ in range(3):
+        td3.train(td3_buffer, batch_size=batch)  # update 4: policy step
+    assert changed(head_before, td3.actor.l1)
+
+    rcrl = RCRLTD3(
+        state_dim, 2, 1.0, policy_freq=4, lidar_encoder=True,
+        num_lidar_rays=num_rays, actor_encoder_every_step=True,
+        initial_lambda=5.0,
+    )
+    rcrl_buffer = ReplayBufferRCRLTD3Torch(
+        state_dim, 2, max_size=1024, device=device
+    )
+    rcrl_buffer.add_batch(
+        np.random.randn(batch, state_dim),
+        np.random.randn(batch, 2),
+        np.random.randn(batch, state_dim),
+        np.random.randn(batch),
+        np.full((batch, 1), 0.5),
+        np.full((batch, 1), 0.5),
+        np.ones(batch),
+    )
+    encoder_before = snapshot(rcrl.actor.encoder)
+    head_before = snapshot(rcrl.actor.l1)
+    rcrl.train(rcrl_buffer, batch_size=batch)  # update 1: non-policy step
+    assert changed(encoder_before, rcrl.actor.encoder)
+    assert unchanged(head_before, rcrl.actor.l1)
+    head_before = snapshot(rcrl.actor.l1)
+    for _ in range(3):
+        rcrl.train(rcrl_buffer, batch_size=batch)  # update 4: policy step
+    assert changed(head_before, rcrl.actor.l1)
+    print("PASS: actor encoder every-step updates")
+
+
+def test_ray_encoder():
+    """The ray encoder is dimension-agnostic, invariant and exact."""
+    import math
+
+    import torch
+    from agents.encoders import LidarStateEncoder, RayEncoder
+    from agents.rcrl_td3 import RCRLTD3
+    from agents.td3 import TD3
+
+    num_rays = env.num_lidar_rays
+    state_dim = env.observation_space.shape[0]
+
+    def observation(batch=4):
+        # Observation-like ranges: velocity ~1 m/s, lidar in [0, 5] m,
+        # goal offsets ~ several metres.
+        state = torch.rand(batch, state_dim)
+        state[:, :2] = 2.0 * state[:, :2] - 1.0
+        state[:, 2:2 + num_rays] *= 5.0
+        state[:, -2:] = 6.0 * state[:, -2:] - 3.0
+        return state
+
+    encoder = LidarStateEncoder(state_dim, num_rays, kind="ray")
+    # d = 2, C = 16: inv 8 + vectors 8*2 + norms 8 + min 1 + u* 2 = 35.
+    assert encoder.lidar.output_dim == 35
+    assert encoder.input_dim == 4 + 35
+    state = observation()
+    assert encoder(state).shape == (4, 39)
+    assert encoder(state[0]).shape == (39,)
+
+    # Dropping the exact-min skip removes 1 + d inputs.
+    no_min = LidarStateEncoder(
+        state_dim, num_rays, kind="ray", ray_exact_min=False
+    )
+    assert no_min.input_dim == 39 - 3
+    assert no_min(state).shape == (4, 36)
+
+    # A three-dimensional sensor: d is inferred from the state size and the
+    # ray directions are supplied, so the same module runs unchanged.
+    directions3 = torch.randn(8, 3)
+    directions3 = directions3 / directions3.norm(dim=-1, keepdim=True)
+    encoder3 = LidarStateEncoder(
+        2 * 3 + 8, 8, kind="ray", ray_directions=directions3
+    )
+    assert encoder3.input_dim == 2 * 3 + (8 + 8 * 3 + 8 + 4)
+    assert encoder3.input_dim == 50
+    assert encoder3(torch.rand(5, 14)).shape == (5, 50)
+    try:
+        RayEncoder(num_rays=8, spatial_dim=3)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("3-D ray encoder needs supplied directions")
+    try:
+        RayEncoder(num_rays=8, spatial_dim=2, channels=1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("channels < 2 must be rejected")
+
+    # Permuting the rays together with their directions leaves the output
+    # unchanged: no angular ordering is used anywhere.
+    ray = encoder.lidar
+    lidar = torch.rand(2, num_rays) * 5.0
+    permutation = torch.randperm(num_rays)
+    permuted = RayEncoder(num_rays, 2, 16)
+    permuted.load_state_dict(ray.state_dict())
+    permuted.directions = ray.directions[permutation]
+    torch.testing.assert_close(ray(lidar), permuted(lidar[:, permutation]))
+
+    # Rotating the world rotates the vector block and the argmin direction,
+    # while the invariant block, the vector norms and the minimum stay put.
+    angle = 0.7
+    rotation = torch.tensor(
+        [
+            [math.cos(angle), -math.sin(angle)],
+            [math.sin(angle), math.cos(angle)],
+        ]
+    )
+    rotated = RayEncoder(num_rays, 2, 16)
+    rotated.load_state_dict(ray.state_dict())
+    rotated.directions = ray.directions @ rotation.T
+    before = ray(lidar)
+    after = rotated(lidar)
+    invariant_dim = ray.invariant_dim
+    vector_dim = ray.vector_dim
+    vector_end = invariant_dim + vector_dim * 2
+    norm_end = vector_end + vector_dim
+    torch.testing.assert_close(
+        before[:, :invariant_dim], after[:, :invariant_dim]
+    )
+    torch.testing.assert_close(
+        before[:, vector_end:norm_end], after[:, vector_end:norm_end]
+    )
+    torch.testing.assert_close(before[:, norm_end], after[:, norm_end])
+    before_vectors = before[:, invariant_dim:vector_end].reshape(-1, 2)
+    after_vectors = after[:, invariant_dim:vector_end].reshape(-1, 2)
+    torch.testing.assert_close(after_vectors, before_vectors @ rotation.T)
+    torch.testing.assert_close(after[:, -2:], before[:, -2:] @ rotation.T)
+
+    # The exact-min skip carries the minimum and its argmin direction.
+    lidar = torch.full((1, num_rays), 5.0)
+    lidar[0, 7] = 0.4
+    observation_min = torch.cat(
+        (torch.zeros(1, 2), lidar, torch.zeros(1, 2)), dim=-1
+    )
+    # Encoded state is [velocity(2), z(35), goal(2)]; z ends with
+    # [min(1), u*(2)] before the goal block.
+    encoded = encoder(observation_min)
+    assert torch.isclose(encoded[0, -5], torch.tensor(0.4))
+    torch.testing.assert_close(encoded[0, -4:-2], ray.directions[7])
+
+    # Registered buffers: the ray encoder owns its ray geometry, and the
+    # conv/linear kinds keep their original state dicts.
+    keys = encoder.state_dict().keys()
+    assert "lidar.per_ray.0.weight" in keys
+    assert "lidar.directions" in keys
+    assert "ray_angles" not in keys
+    assert "lidar.net.0.weight" in LidarStateEncoder(
+        state_dim, num_rays, 16
+    ).state_dict()
+    assert "lidar.net.0.weight" in LidarStateEncoder(
+        state_dim, num_rays, 16, kind="linear"
+    ).state_dict()
+
+    # The agents build every network's encoder with the ray kind and the
+    # actor-encoder machinery works because the encoder has parameters.
+    td3 = TD3(
+        state_dim, 2, 1.0, lidar_encoder=True, num_lidar_rays=num_rays,
+        lidar_encoder_kind="ray",
+    )
+    assert td3.actor.l1.in_features == 39
+    with torch.no_grad():
+        td3.critic.encoder.lidar.per_ray[0].weight.add_(1.0)
+    assert td3.warm_start_actor_encoder()
+    torch.testing.assert_close(
+        td3.actor.encoder.lidar.per_ray[0].weight,
+        td3.critic.encoder.lidar.per_ray[0].weight,
+    )
+
+    rcrl = RCRLTD3(
+        state_dim, 2, 1.0, lidar_encoder=True, num_lidar_rays=num_rays,
+        lidar_encoder_kind="ray", safety_twin=True, initial_lambda=5.0,
+        multiplier_type="network",
+    )
+    assert rcrl.actor.l1.in_features == 39
+    assert rcrl.safety_critic.encoder.input_dim == 39
+    assert rcrl.multiplier.encoder.input_dim == 39
+    print("PASS: ray encoder shapes, symmetry, exactness and agents")
+
+
 #test_render(env)
 test_collisions(env)
 test_lidar(env)
@@ -554,10 +904,14 @@ test_gymnasium_env(env)
 test_random_state_sampling(env)
 test_randomized_reset(env)
 test_min_start_goal_distance(env)
+test_goal_near(env)
 test_variable_layouts()
 test_goal(env)
 test_batch_matches_single()
 test_constraint_and_reward_scale()
 test_back_wall(env)
+test_lidar_encoder()
+test_actor_encoder_every_step()
+test_ray_encoder()
 #test_velocity_limit(dynamics)
 test_reward_and_constraints(env)

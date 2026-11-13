@@ -44,11 +44,28 @@ def lidar_encoder_kwargs(config):
     Runs trained before the encoder existed have no ``lidar_encoder`` key and
     must be reconstructed with the raw-lidar MLP, so the flag defaults to
     ``False`` here even though new training enables the encoder by default.
+    The actor's encoder learning rate only matters for the optimiser state
+    restored by ``load``, but the number of optimiser param groups has to
+    match the checkpoint, so it is read back here too.
     """
     return {
         "lidar_encoder": bool(config.get("lidar_encoder", False)),
         "lidar_embed_dim": config.get("lidar_embed_dim", 16),
         "num_lidar_rays": config.get("num_lidar_rays", 64),
+        "actor_encoder_lr": config.get("actor_encoder_lr"),
+        "actor_encoder_lr_final": config.get("actor_encoder_lr_final"),
+        # Structure flags default to the original CNN without min features,
+        # so checkpoints from before they existed load unchanged. The
+        # every-step training flag changes no weights and is not read back.
+        "lidar_encoder_kind": config.get("lidar_encoder_kind", "conv"),
+        "lidar_encoder_min": bool(config.get("lidar_encoder_min", False)),
+        # Ray-encoder settings are scalars rather than buffers, so a missing
+        # key would silently build a different architecture and still load.
+        # Read them back with the training defaults.
+        "lidar_ray_channels": config.get("lidar_ray_channels", 16),
+        "lidar_ray_exact_min": bool(
+            config.get("lidar_ray_exact_min", True)
+        ),
     }
 
 

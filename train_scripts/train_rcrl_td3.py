@@ -56,11 +56,18 @@ def main(args):
         args.layout_set,
         normalize_obs=args.normalize_obs,
         reward_scale=args.reward_scale,
+        goal_radius=args.goal_radius,
         max_steps=args.max_steps,
     )
     env.action_space.seed(args.seed)
     if args.min_start_goal_distance is None:
         args.min_start_goal_distance = 2.0 * env.goal_radius
+        if args.goal_radius != 0.5:
+            print(
+                f"warning: --min-start-goal-distance defaults to "
+                f"2 * goal_radius = {args.min_start_goal_distance:.1f} m; "
+                "pass it explicitly to keep the previous episode distribution"
+            )
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
@@ -100,6 +107,13 @@ def main(args):
         lidar_encoder=args.lidar_encoder,
         lidar_embed_dim=args.lidar_embed_dim,
         num_lidar_rays=env.num_lidar_rays,
+        actor_encoder_lr=args.actor_encoder_lr,
+        actor_encoder_lr_final=args.actor_encoder_lr_final,
+        lidar_encoder_kind=args.lidar_encoder_kind,
+        lidar_encoder_min=args.lidar_encoder_min,
+        actor_encoder_every_step=args.actor_encoder_every_step,
+        lidar_ray_channels=args.lidar_ray_channels,
+        lidar_ray_exact_min=args.lidar_ray_exact_min,
     )
     if args.random_reset_max_speed > env.dynamics.max_velocity:
         raise ValueError(
@@ -163,9 +177,13 @@ def main(args):
     episode_margin_steps = 0
     episode_max_h = -np.inf
     episode_num = 0
+    warm_start_done = args.warm_start_actor_encoder <= 0
     # Mean training losses since the last progress record.
-    window_critic_losses = []
-    window_safety_losses = []
+    # Running loss sums, reduced once per log window instead of reading each
+    # update's scalars back to the host.
+    window_critic_loss_sum = None
+    window_safety_loss_sum = None
+    window_loss_updates = 0
 
     try:
         for timestep in range(args.max_timesteps):
@@ -199,10 +217,34 @@ def main(args):
             state = next_state
 
             if replay_buffer.size >= args.batch_size:
-                metrics = policy.train(replay_buffer, batch_size=args.batch_size)
+                metrics = policy.train(
+                    replay_buffer,
+                    batch_size=args.batch_size,
+                    sync_metrics=False,
+                )
                 if args.log_freq > 0:
-                    window_critic_losses.append(metrics["critic_loss"])
-                    window_safety_losses.append(metrics["safety_loss"])
+                    critic_loss = metrics["critic_loss"]
+                    safety_loss = metrics["safety_loss"]
+                    window_critic_loss_sum = (
+                        critic_loss if window_critic_loss_sum is None
+                        else window_critic_loss_sum + critic_loss
+                    )
+                    window_safety_loss_sum = (
+                        safety_loss if window_safety_loss_sum is None
+                        else window_safety_loss_sum + safety_loss
+                    )
+                    window_loss_updates += 1
+
+            if (
+                not warm_start_done
+                and timestep + 1 >= args.warm_start_actor_encoder
+            ):
+                warm_start_done = True
+                if policy.warm_start_actor_encoder():
+                    print(
+                        f"Step {timestep + 1}: copied the critic lidar encoder "
+                        f"into the actor and its target"
+                    )
 
             if terminated or truncated:
                 if episode_num % 20 == 0:
@@ -251,12 +293,12 @@ def main(args):
                         f"lambda_at_floor={lambda_stats['floor_fraction']:.1%}"
                     )
                 progress_metrics = {}
-                if window_critic_losses:
+                if window_loss_updates:
                     progress_metrics["critic_loss"] = float(
-                        np.mean(window_critic_losses)
+                        window_critic_loss_sum / window_loss_updates
                     )
                     progress_metrics["safety_loss"] = float(
-                        np.mean(window_safety_losses)
+                        window_safety_loss_sum / window_loss_updates
                     )
                     message += (
                         f", critic_loss={progress_metrics['critic_loss']:.4f}"
@@ -271,8 +313,9 @@ def main(args):
                     **lambda_metrics(lambda_stats),
                     **progress_metrics,
                 )
-                window_critic_losses.clear()
-                window_safety_losses.clear()
+                window_critic_loss_sum = None
+                window_safety_loss_sum = None
+                window_loss_updates = 0
 
             if args.save_freq > 0 and (timestep + 1) % args.save_freq == 0:
                 policy.save(model_path)
@@ -359,8 +402,100 @@ def parse_args():
         "--lidar-embed-dim",
         type=int,
         default=16,
-        help="Number of angular bins the lidar encoder produces (default 16); "
-             "with 64 rays and stride 4 only 16 bins reproduce the ray count",
+        help="Number of angular bins the conv and linear lidar encoders "
+             "produce (default 16); with 64 rays and stride 4 only 16 bins "
+             "reproduce the ray count. Ignored by --lidar-encoder-kind ray, "
+             "which uses --lidar-ray-channels",
+    )
+    parser.add_argument(
+        "--actor-encoder-lr",
+        type=float,
+        default=None,
+        help="Learning rate for the actor's lidar encoder, on its own Adam "
+             "param group; default uses --actor-lr. The actor encoder only "
+             "updates on policy steps, so this rate is paid once per "
+             "--policy-freq steps while the critic encoder trains every step",
+    )
+    parser.add_argument(
+        "--actor-encoder-lr-final",
+        type=float,
+        default=None,
+        help="Final value of the linear anneal for --actor-encoder-lr; "
+             "default uses --actor-lr-final",
+    )
+    parser.add_argument(
+        "--warm-start-actor-encoder",
+        type=int,
+        default=0,
+        metavar="STEPS",
+        help="Copy the critic's lidar encoder into the actor and its target "
+             "once at this many environment steps (0 disables); the critic "
+             "encoder trains every step and is useful much earlier",
+    )
+    parser.add_argument(
+        "--lidar-encoder-kind",
+        choices=["conv", "linear", "ray"],
+        default="conv",
+        help="Structure of the lidar encoder: the circular 1-D CNN (default), "
+             "a single dense layer over all rays (same bottleneck, no weight "
+             "sharing, a control that separates the convolution prior from "
+             "the compression), or the shared per-ray MLP with invariant and "
+             "equivariant pooling, which uses no angular ordering and works "
+             "for any ray count and spatial dimension",
+    )
+    parser.add_argument(
+        "--lidar-encoder-min",
+        dest="lidar_encoder_min",
+        action="store_true",
+        default=False,
+        help="Append the exact minimum lidar range and the unit bearing of "
+             "the closest ray (three extra MLP inputs) so the encoder cannot "
+             "average away the statistic the constraint is built on",
+    )
+    parser.add_argument(
+        "--no-lidar-encoder-min",
+        dest="lidar_encoder_min",
+        action="store_false",
+        help="Do not append the exact minimum range and bearing (default)",
+    )
+    parser.add_argument(
+        "--lidar-ray-channels",
+        type=int,
+        default=16,
+        metavar="C",
+        help="Width of the shared per-ray MLP in the ray encoder (default 16); "
+             "half of the channels are pooled invariantly and half act as "
+             "weights on the ray directions",
+    )
+    parser.add_argument(
+        "--lidar-ray-exact-min",
+        dest="lidar_ray_exact_min",
+        action="store_true",
+        default=True,
+        help="Append the exact minimum range and the direction of its argmin "
+             "ray after the pooled features (default); the ray encoder's "
+             "learned pool cannot be guaranteed to preserve that statistic",
+    )
+    parser.add_argument(
+        "--no-lidar-ray-exact-min",
+        dest="lidar_ray_exact_min",
+        action="store_false",
+        help="Drop the exact minimum and argmin direction from the ray encoder",
+    )
+    parser.add_argument(
+        "--actor-encoder-every-step",
+        dest="actor_encoder_every_step",
+        action="store_true",
+        default=False,
+        help="Train the actor's lidar encoder on every update: on non-policy "
+             "steps backprop the actor loss into the encoder only, leaving "
+             "the MLP head frozen until the next policy step",
+    )
+    parser.add_argument(
+        "--no-actor-encoder-every-step",
+        dest="actor_encoder_every_step",
+        action="store_false",
+        help="Update the actor encoder only on policy steps (default)",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-timesteps", type=int, default=30_000)
@@ -513,6 +648,13 @@ def parse_args():
                              "boundary for sampled start and goal states")
     parser.add_argument("--random-reset-max-speed", type=float, default=1.0,
                         help="Maximum speed (m/s) of the sampled start velocity")
+    parser.add_argument("--goal-radius", type=float, default=0.5,
+                        help="Radius (m) of the circular goal used while "
+                             "training. Evaluation always uses the standard "
+                             "0.5 m radius, so --goal-radius 0.3 trains on a "
+                             "stricter target and is still scored at 0.5 m. "
+                             "Also changes the default of "
+                             "--min-start-goal-distance (2 * radius)")
     parser.add_argument("--min-start-goal-distance", type=float, default=None,
                         help="Minimum start-goal distance (m) for sampled "
                              "episodes; default is 2 * goal_radius (1.0 m). "
@@ -585,6 +727,8 @@ def parse_args():
         parser.error("--random-reset-margin must be nonnegative")
     if args.random_reset_max_speed <= 0:
         parser.error("--random-reset-max-speed must be positive")
+    if args.goal_radius <= 0:
+        parser.error("--goal-radius must be positive")
     if (args.min_start_goal_distance is not None
             and args.min_start_goal_distance < 0):
         parser.error("--min-start-goal-distance must be nonnegative")
@@ -596,6 +740,39 @@ def parse_args():
         parser.error("--save-freq must be nonnegative")
     if args.lidar_embed_dim < 1:
         parser.error("--lidar-embed-dim must be positive")
+    if args.actor_encoder_lr is not None and args.actor_encoder_lr <= 0:
+        parser.error("--actor-encoder-lr must be positive")
+    if args.actor_encoder_lr_final is not None:
+        if args.actor_encoder_lr is None:
+            parser.error(
+                "--actor-encoder-lr-final requires --actor-encoder-lr"
+            )
+        if args.actor_encoder_lr_final <= 0:
+            parser.error("--actor-encoder-lr-final must be positive")
+    if args.warm_start_actor_encoder < 0:
+        parser.error("--warm-start-actor-encoder must be nonnegative")
+    if (
+        args.actor_encoder_lr is not None
+        or args.warm_start_actor_encoder > 0
+    ) and not args.lidar_encoder:
+        parser.error(
+            "the actor encoder options require the lidar encoder"
+        )
+    if args.lidar_ray_channels < 2:
+        parser.error("--lidar-ray-channels must be at least 2")
+    if (
+        args.lidar_encoder_kind != "conv"
+        or args.lidar_encoder_min
+        or args.actor_encoder_every_step
+    ) and not args.lidar_encoder:
+        parser.error(
+            "the lidar encoder kind, min features and every-step updates "
+            "require --lidar-encoder"
+        )
+    if args.warm_start_actor_encoder > args.max_timesteps:
+        parser.error(
+            "--warm-start-actor-encoder must not exceed --max-timesteps"
+        )
     return args
 
 

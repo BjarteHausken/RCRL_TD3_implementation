@@ -236,6 +236,14 @@ class RCRLTD3:
         lidar_encoder=False,
         lidar_embed_dim=16,
         num_lidar_rays=64,
+        actor_encoder_lr=None,
+        actor_encoder_lr_final=None,
+        lidar_encoder_kind="conv",
+        lidar_encoder_min=False,
+        actor_encoder_every_step=False,
+        lidar_ray_channels=16,
+        lidar_ray_exact_min=True,
+        lidar_ray_directions=None,
     ):
         if policy_freq < 1:
             raise ValueError("policy_freq must be positive")
@@ -298,6 +306,34 @@ class RCRLTD3:
             raise ValueError("lidar_embed_dim must be positive")
         if num_lidar_rays < 1:
             raise ValueError("num_lidar_rays must be positive")
+        if actor_encoder_lr is not None and actor_encoder_lr <= 0:
+            raise ValueError("actor_encoder_lr must be positive or None")
+        if actor_encoder_lr_final is not None:
+            if actor_encoder_lr is None:
+                raise ValueError(
+                    "actor_encoder_lr_final requires actor_encoder_lr"
+                )
+            if actor_encoder_lr_final <= 0:
+                raise ValueError(
+                    "actor_encoder_lr_final must be positive or None"
+                )
+        if (
+            actor_encoder_lr is not None
+            or actor_encoder_lr_final is not None
+        ) and not lidar_encoder:
+            raise ValueError(
+                "actor encoder learning rates require the lidar encoder"
+            )
+        if lidar_encoder_kind not in ("conv", "linear", "ray"):
+            raise ValueError(f"unknown lidar encoder kind {lidar_encoder_kind!r}")
+        if lidar_ray_channels < 2:
+            raise ValueError("lidar_ray_channels must be at least 2")
+        if (lidar_encoder_kind != "conv" or lidar_encoder_min
+                or actor_encoder_every_step) and not lidar_encoder:
+            raise ValueError(
+                "lidar encoder kind, min features and every-step updates "
+                "require the lidar encoder"
+            )
 
         # The paper's Table 1 uses Adam with beta1 = 0.99, beta2 = 0.999.
         self.adam_betas = (0.99, 0.999)
@@ -309,15 +345,69 @@ class RCRLTD3:
         self.lidar_encoder = bool(lidar_encoder)
         self.lidar_embed_dim = int(lidar_embed_dim)
         self.num_lidar_rays = int(num_lidar_rays)
+        # ``conv`` is the circular CNN, ``linear`` the dense bottleneck
+        # control. ``lidar_encoder_min`` appends the exact minimum range and
+        # its bearing, which the conv's angular average cannot represent.
+        self.lidar_encoder_kind = lidar_encoder_kind
+        self.lidar_encoder_min = bool(lidar_encoder_min)
+        # Update the actor encoder on every training update (encoder-only
+        # gradient on non-policy steps) instead of once per ``policy_freq``.
+        self.actor_encoder_every_step = bool(actor_encoder_every_step)
+        # ``ray`` is the dimension-agnostic per-ray MLP: the two settings
+        # shape it, and ``lidar_ray_directions`` supplies the ray geometry
+        # when the spatial dimension is not 2.
+        self.lidar_ray_channels = int(lidar_ray_channels)
+        self.lidar_ray_exact_min = bool(lidar_ray_exact_min)
+        self.lidar_ray_directions = lidar_ray_directions
+        # Optional separate learning-rate schedule for the actor's lidar
+        # encoder. The actor encoder trains once per ``policy_freq`` steps at
+        # ``actor_lr`` while the critic and safety encoders train every step
+        # at the (larger) critic rate, so the actor's lidar features can lag
+        # far behind. Its own param group removes that gap without changing
+        # the schedule of the MLP head. ``None`` keeps a single group.
+        self.actor_encoder_lr = (
+            None if actor_encoder_lr is None else float(actor_encoder_lr)
+        )
+        self.actor_encoder_lr_final = (
+            None if self.actor_encoder_lr is None else float(
+                actor_lr_final if actor_encoder_lr_final is None
+                else actor_encoder_lr_final
+            )
+        )
 
         self.actor = Actor(
             state_dim, action_dim, max_action,
             encoder=self._make_state_encoder(),
         ).to(device)
         self.actor_target = copy.deepcopy(self.actor)
-        self.actor_optimizer = torch.optim.Adam(
-            self.actor.parameters(), lr=actor_lr, betas=self.adam_betas
-        )
+        if self.actor_encoder_lr is None:
+            self.actor_optimizer = torch.optim.Adam(
+                self.actor.parameters(), lr=actor_lr, betas=self.adam_betas
+            )
+            self.actor_lr_schedule = [(actor_lr, actor_lr_final)]
+        else:
+            # ``named_parameters`` lists the encoder first, so filtering on
+            # the prefix leaves the head in its construction order.
+            head_parameters = [
+                parameter
+                for name, parameter in self.actor.named_parameters()
+                if not name.startswith("encoder.")
+            ]
+            self.actor_optimizer = torch.optim.Adam(
+                [
+                    {"params": head_parameters, "lr": actor_lr},
+                    {
+                        "params": list(self.actor.encoder.parameters()),
+                        "lr": self.actor_encoder_lr,
+                    },
+                ],
+                lr=actor_lr,
+                betas=self.adam_betas,
+            )
+            self.actor_lr_schedule = [
+                (actor_lr, actor_lr_final),
+                (self.actor_encoder_lr, self.actor_encoder_lr_final),
+            ]
 
         self.critic = Critic(
             state_dim, action_dim, encoder=self._make_state_encoder()
@@ -413,7 +503,29 @@ class RCRLTD3:
             state_dim=self.state_dim,
             num_lidar_rays=self.num_lidar_rays,
             embed_dim=self.lidar_embed_dim,
+            kind=self.lidar_encoder_kind,
+            min_features=self.lidar_encoder_min,
+            ray_channels=self.lidar_ray_channels,
+            ray_exact_min=self.lidar_ray_exact_min,
+            ray_directions=self.lidar_ray_directions,
         )
+
+    def warm_start_actor_encoder(self):
+        """Copy the critic's lidar encoder into the actor and its target.
+
+        The critic and safety encoders train every step at the critic rate,
+        so their lidar features are usable long before the actor's encoder,
+        which trains once per ``policy_freq`` steps at the actor rate. A
+        one-time copy tests whether the actor's own features otherwise
+        arrive too late to shape the policy. Returns ``False`` when the
+        encoder is disabled.
+        """
+        if self.actor.encoder is None:
+            return False
+        encoder_state = self.critic.encoder.state_dict()
+        self.actor.encoder.load_state_dict(encoder_state)
+        self.actor_target.encoder.load_state_dict(encoder_state)
+        return True
 
     def multiplier_for(self, state):
         """Lagrange multiplier as a (batch, 1) tensor for this state."""
@@ -500,11 +612,19 @@ class RCRLTD3:
         progress = min(1.0, self.total_it / self.anneal_steps)
         return initial + (final - initial) * progress
 
-    def _apply_learning_rate(self, optimizer, initial, final):
-        """Set ``optimizer`` to its scheduled rate for the current update."""
-        learning_rate = self._learning_rate(initial, final)
-        for group in optimizer.param_groups:
-            group["lr"] = learning_rate
+    def _apply_learning_rate(self, optimizer, initial, final=None):
+        """Set ``optimizer`` to its scheduled rate(s) for the current update.
+
+        ``initial`` is either one starting rate for every parameter group or
+        a sequence of ``(initial, final)`` pairs with one pair per group, as
+        the actor uses when its encoder follows its own schedule.
+        """
+        if final is None:
+            schedules = list(initial)
+        else:
+            schedules = [(initial, final)] * len(optimizer.param_groups)
+        for group, (start, end) in zip(optimizer.param_groups, schedules):
+            group["lr"] = self._learning_rate(start, end)
 
     def safety_target(self, next_state, h, next_h, not_done):
         """One-step reachability target for the safety critic.
@@ -616,7 +736,17 @@ class RCRLTD3:
             )
         return replay_buffer.sample(batch_size)
 
-    def train(self, replay_buffer, batch_size=256, injection_buffer=None):
+    def train(self, replay_buffer, batch_size=256, injection_buffer=None,
+              sync_metrics=True):
+        """One training update; returns the diagnostic metrics.
+
+        With ``sync_metrics=False`` the returned values are detached device
+        tensors rather than Python floats. Reading a scalar back with
+        ``.item()`` synchronises the device, so a caller that runs many
+        updates back-to-back and only logs their mean can keep the values on
+        the device and reduce them once per log window; that removes several
+        stream syncs per update without changing any gradient.
+        """
         self.total_it += 1
         state, action, next_state, reward, h, next_h, not_done = replay_buffer.sample(batch_size)
 
@@ -656,7 +786,7 @@ class RCRLTD3:
             current_h, safety_loss = self._update_safety_critic(
                 state, action, next_state, h, next_h, not_done
             )
-            safety_loss_values = [safety_loss.item()]
+            safety_loss_values = [safety_loss.detach()]
         else:
             safety_batch_size = self.safety_batch_size or batch_size
             safety_loss_values = []
@@ -680,18 +810,19 @@ class RCRLTD3:
                     safety_next_h,
                     safety_not_done,
                 )
-                safety_loss_values.append(safety_loss.item())
-        mean_safety_loss = sum(safety_loss_values) / len(safety_loss_values)
+                safety_loss_values.append(safety_loss.detach())
+        mean_safety_loss = torch.stack(safety_loss_values).mean()
 
         metrics = {
-            "critic_loss": critic_loss.item(),
+            "critic_loss": critic_loss.detach(),
             "safety_loss": mean_safety_loss,
-            "mean_constraint": h.mean().item(),
-            "mean_safety_value": current_h.detach().mean().item(),
-            "mean_multiplier": self.multiplier_for(state).detach().mean().item(),
+            "mean_constraint": h.detach().mean(),
+            "mean_safety_value": current_h.detach().mean(),
+            "mean_multiplier": self.multiplier_for(state).detach().mean(),
         }
 
-        if self.total_it % self.policy_freq == 0:
+        policy_step = self.total_it % self.policy_freq == 0
+        if policy_step:
             self._set_requires_grad([self.critic, self.safety_critic], False)
             policy_action = self.actor(state)
             q_pi = self.critic.q1(state, policy_action)
@@ -708,15 +839,42 @@ class RCRLTD3:
             actor_loss.backward()
             self._clip_grads(self.actor)
             self._apply_learning_rate(
-                self.actor_optimizer, self.actor_lr, self.actor_lr_final
+                self.actor_optimizer, self.actor_lr_schedule
             )
             self.actor_optimizer.step()
             self._set_requires_grad([self.critic, self.safety_critic], True)
 
-            metrics["actor_loss"] = actor_loss.item()
+            metrics["actor_loss"] = actor_loss.detach()
             self._soft_update(self.actor, self.actor_target, self.tau)
             self._soft_update(self.critic, self.critic_target, self.tau)
             self._soft_update(self.safety_critic, self.safety_critic_target, self.tau)
+        elif self.actor_encoder_every_step and self.actor.encoder is not None:
+            # Non-policy update: train only the actor's lidar encoder from the
+            # actor loss. ``zero_grad(set_to_none=True)`` clears the head's
+            # gradients so Adam skips those parameters and they keep the
+            # values from the last policy step.
+            self._set_requires_grad([self.critic, self.safety_critic], False)
+            policy_action = self.actor(state)
+            q_pi = self.critic.q1(state, policy_action)
+            if self.safety_twin:
+                qh_pi = self.safety_critic.h1(state, policy_action)
+            else:
+                qh_pi = self.safety_critic(state, policy_action)
+            lambda_s = self.multiplier_for(state).detach()
+            actor_loss = (-q_pi + lambda_s * qh_pi).mean()
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            actor_loss.backward(inputs=list(self.actor.encoder.parameters()))
+            self._clip_grads(self.actor.encoder)
+            self._apply_learning_rate(
+                self.actor_optimizer, self.actor_lr_schedule
+            )
+            self.actor_optimizer.step()
+            self._set_requires_grad([self.critic, self.safety_critic], True)
+            metrics["actor_encoder_loss"] = actor_loss.detach()
+            # The target policy uses this encoder, so it has to track it.
+            self._soft_update(
+                self.actor.encoder, self.actor_target.encoder, self.tau
+            )
 
         if self.multiplier_type == "network" and self.total_it % self.multiplier_freq == 0:
             with torch.no_grad():
@@ -743,8 +901,10 @@ class RCRLTD3:
                 self.multiplier_lr_final,
             )
             self.multiplier_optimizer.step()
-            metrics["multiplier_loss"] = multiplier_loss.item()
+            metrics["multiplier_loss"] = multiplier_loss.detach()
 
+        if sync_metrics:
+            metrics = {name: value.item() for name, value in metrics.items()}
         return metrics
 
     def save(self, filename):
